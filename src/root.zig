@@ -50,3 +50,30 @@ test "module surface compiles" {
     _ = IndexBlock;
     _ = BlockLocator;
 }
+
+// Force `test` blocks in every submodule to be discovered by `zig build
+// test`. A `pub const ns = @import("...")` re-export does not by itself
+// pull in the file's tests — only members accessed via `ns.Foo` get
+// analyzed. The unnamed test block below is the canonical Zig idiom for
+// "include every file's tests, recursively".
+test {
+    _ = @import("sstable/index.zig");
+    _ = @import("sstable/format.zig");
+    _ = @import("sstable/footer.zig");
+    _ = @import("sstable/reader.zig");
+    _ = @import("sstable/writer.zig");
+    _ = @import("engine/engine.zig");
+    _ = @import("engine/memtable.zig");
+    _ = @import("engine/compaction.zig");
+    _ = @import("bloom/filter.zig");
+    _ = @import("cache/lru.zig");
+    _ = @import("cache/block_cache.zig");
+    _ = @import("storage/gcs.zig");
+    _ = @import("storage/auth.zig");
+    _ = @import("prefetch/adaptive.zig");
+    _ = @import("alloc/arena_pool.zig");
+    _ = @import("alloc/tracking.zig");
+    _ = @import("util/varint.zig");
+    _ = @import("util/crc.zig");
+    _ = @import("util/endian.zig");
+}
