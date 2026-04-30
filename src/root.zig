@@ -27,6 +27,7 @@ pub const block_cache = @import("cache/block_cache.zig");
 pub const gcs = @import("storage/gcs.zig");
 pub const auth = @import("storage/auth.zig");
 pub const blob = @import("storage/blob.zig");
+pub const gcs_storage = @import("storage/gcs_storage.zig");
 
 pub const prefetch = @import("prefetch/adaptive.zig");
 
@@ -74,6 +75,7 @@ test {
     _ = @import("storage/gcs.zig");
     _ = @import("storage/auth.zig");
     _ = @import("storage/blob.zig");
+    _ = @import("storage/gcs_storage.zig");
     _ = @import("prefetch/adaptive.zig");
     _ = @import("alloc/arena_pool.zig");
     _ = @import("alloc/tracking.zig");
