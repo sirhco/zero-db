@@ -32,6 +32,8 @@ pub const gcs_storage = @import("storage/gcs_storage.zig");
 
 pub const prefetch = @import("prefetch/adaptive.zig");
 
+pub const server = @import("server/http.zig");
+
 pub const arena_pool = @import("alloc/arena_pool.zig");
 pub const tracking = @import("alloc/tracking.zig");
 
@@ -79,6 +81,7 @@ test {
     _ = @import("storage/blob.zig");
     _ = @import("storage/gcs_storage.zig");
     _ = @import("prefetch/adaptive.zig");
+    _ = @import("server/http.zig");
     _ = @import("alloc/arena_pool.zig");
     _ = @import("alloc/tracking.zig");
     _ = @import("util/varint.zig");
