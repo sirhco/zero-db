@@ -26,30 +26,36 @@ pub fn main(init: std.process.Init) !void {
     try stdout_writer.flush();
 }
 
-/// Build a small index block in memory, parse it back, and look a key up.
-/// Confirms the index parser is reachable from the binary, not just from
-/// the test runner.
+/// Drive the full Engine end-to-end from the binary: set, flush, delete,
+/// re-set, get across MemTable + SSTable tiers. Confirms the LSM read/write
+/// path is reachable from the executable, not just from the test runner.
 fn selftest(gpa: std.mem.Allocator, w: *Io.Writer) !void {
-    const idx_mod = zero_db.sstable_index;
+    var e = try zero_db.engine.Engine.init(gpa, .{ .memtable_flush_bytes = 4096 });
+    defer e.deinit();
 
-    const entries = [_]idx_mod.BuilderEntry{
-        .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
-        .{ .key = "mango", .block_offset = 100, .block_size = 50 },
-        .{ .key = "zeta", .block_offset = 150, .block_size = 25 },
-    };
-    const buf = try idx_mod.buildIndexBlock(gpa, &entries);
-    defer gpa.free(buf);
+    try e.set("alpha", "AAA");
+    try e.set("mango", "first-mango");
+    try e.set("zeta", "Z-VALUE");
+    try e.flush();
 
-    const idx = try idx_mod.IndexBlock.parse(buf);
-    try w.print("selftest: index entries = {d}\n", .{idx.count()});
+    // Tombstone + override after the first SSTable to exercise tier
+    // shadowing on the read path.
+    try e.delete("alpha");
+    try e.set("mango", "fresher-mango");
+    try e.set("delta", "DDD");
 
-    const probe = "mango";
-    if (try idx.find(probe)) |loc| {
-        try w.print("selftest: find(\"{s}\") -> offset={d}, size={d}\n", .{
-            probe, loc.block_offset, loc.block_size,
-        });
-    } else {
-        try w.print("selftest: find(\"{s}\") -> null\n", .{probe});
+    try w.print("selftest: sstables={d}, active_entries={d}\n", .{
+        e.sstableCount(), e.entryCountActive(),
+    });
+
+    const probes = [_][]const u8{ "alpha", "mango", "zeta", "delta", "ghost" };
+    for (probes) |k| {
+        if (try e.get(k, gpa)) |v| {
+            defer gpa.free(v);
+            try w.print("selftest: get(\"{s}\") -> \"{s}\"\n", .{ k, v });
+        } else {
+            try w.print("selftest: get(\"{s}\") -> null\n", .{k});
+        }
     }
 }
 
