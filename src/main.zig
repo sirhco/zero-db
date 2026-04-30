@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
 fn selftest(gpa: std.mem.Allocator, w: *Io.Writer) !void {
     const idx_mod = zero_db.sstable_index;
 
-    const entries = [_]idx_mod.TestEntry{
+    const entries = [_]idx_mod.BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
         .{ .key = "mango", .block_offset = 100, .block_size = 50 },
         .{ .key = "zeta", .block_offset = 150, .block_size = 25 },

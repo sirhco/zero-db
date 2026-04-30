@@ -136,7 +136,7 @@ pub const IndexBlock = struct {
 // gate so it doesn't bloat the production binary unless explicitly used.
 // ---------------------------------------------------------------------------
 
-pub const TestEntry = struct {
+pub const BuilderEntry = struct {
     key: []const u8,
     block_offset: u64,
     block_size: u32,
@@ -144,7 +144,7 @@ pub const TestEntry = struct {
 
 /// Encode `entries` (already sorted ascending by key) into a fresh index-block
 /// buffer owned by `gpa`. Returned slice must be freed by the caller.
-pub fn buildIndexBlock(gpa: std.mem.Allocator, entries: []const TestEntry) ![]u8 {
+pub fn buildIndexBlock(gpa: std.mem.Allocator, entries: []const BuilderEntry) ![]u8 {
     // Sanity: entries must be sorted; otherwise the bsearch invariant breaks
     // and tests would silently pass against a malformed block.
     if (entries.len > 1) {
@@ -245,7 +245,7 @@ test "parse rejects nonzero flags" {
 
 test "parse rejects truncated body" {
     const gpa = testing.allocator;
-    const entries = [_]TestEntry{
+    const entries = [_]BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
         .{ .key = "mango", .block_offset = 100, .block_size = 50 },
     };
@@ -257,7 +257,7 @@ test "parse rejects truncated body" {
 
 test "find on empty index returns null" {
     const gpa = testing.allocator;
-    const buf = try buildIndexBlock(gpa, &[_]TestEntry{});
+    const buf = try buildIndexBlock(gpa, &[_]BuilderEntry{});
     defer gpa.free(buf);
     const idx = try IndexBlock.parse(buf);
     try testing.expectEqual(@as(u32, 0), idx.count());
@@ -266,7 +266,7 @@ test "find on empty index returns null" {
 
 test "find on single entry hits that entry and clamps above" {
     const gpa = testing.allocator;
-    const entries = [_]TestEntry{
+    const entries = [_]BuilderEntry{
         .{ .key = "only", .block_offset = 42, .block_size = 7 },
     };
     const buf = try buildIndexBlock(gpa, &entries);
@@ -287,7 +287,7 @@ test "find on single entry hits that entry and clamps above" {
 
 test "find: roundtrip 3 keys with lower-bound semantics" {
     const gpa = testing.allocator;
-    const entries = [_]TestEntry{
+    const entries = [_]BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
         .{ .key = "mango", .block_offset = 100, .block_size = 50 },
         .{ .key = "zeta", .block_offset = 150, .block_size = 25 },
@@ -324,7 +324,7 @@ test "find: large index, exact lookups land on their own entries" {
         for (keys.items) |k| gpa.free(k);
         keys.deinit(gpa);
     }
-    var entries: std.ArrayList(TestEntry) = .empty;
+    var entries: std.ArrayList(BuilderEntry) = .empty;
     defer entries.deinit(gpa);
 
     var i: u32 = 0;
@@ -360,7 +360,7 @@ test "find: large index, exact lookups land on their own entries" {
 
 test "corruption: stomped offset surfaces as IndexBlockError" {
     const gpa = testing.allocator;
-    const entries = [_]TestEntry{
+    const entries = [_]BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
         .{ .key = "mango", .block_offset = 100, .block_size = 50 },
         .{ .key = "zeta", .block_offset = 150, .block_size = 25 },
@@ -379,7 +379,7 @@ test "corruption: stomped offset surfaces as IndexBlockError" {
 
 test "corruption: oversized key_len is rejected" {
     const gpa = testing.allocator;
-    const entries = [_]TestEntry{
+    const entries = [_]BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 100 },
     };
     const buf = try buildIndexBlock(gpa, &entries);

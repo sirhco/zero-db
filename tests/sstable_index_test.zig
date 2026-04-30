@@ -16,7 +16,7 @@ fn alloc() std.mem.Allocator {
 
 test "public API: build → parse → find roundtrip" {
     const gpa = alloc();
-    const entries = [_]idx.TestEntry{
+    const entries = [_]idx.BuilderEntry{
         .{ .key = "alpha", .block_offset = 0, .block_size = 64 },
         .{ .key = "bravo", .block_offset = 64, .block_size = 64 },
         .{ .key = "charlie", .block_offset = 128, .block_size = 64 },
@@ -36,7 +36,7 @@ test "public API: build → parse → find roundtrip" {
 
 test "public API: lower-bound returns nearest existing entry" {
     const gpa = alloc();
-    const entries = [_]idx.TestEntry{
+    const entries = [_]idx.BuilderEntry{
         .{ .key = "ddd", .block_offset = 0, .block_size = 1 },
         .{ .key = "fff", .block_offset = 1, .block_size = 2 },
         .{ .key = "hhh", .block_offset = 3, .block_size = 4 },
