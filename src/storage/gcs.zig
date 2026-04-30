@@ -143,7 +143,7 @@ pub fn appendUrlEncoded(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []co
         if (isUnreserved(c) or c == '/') {
             try out.append(gpa, c);
         } else {
-            try out.print(gpa, "%{X:0>2}", .{c});./
+            try out.print(gpa, "%{X:0>2}", .{c});
         }
     }
 }

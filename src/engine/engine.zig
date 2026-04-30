@@ -21,6 +21,7 @@ const std = @import("std");
 const memtable_mod = @import("memtable.zig");
 const writer = @import("../sstable/writer.zig");
 const reader_mod = @import("../sstable/reader.zig");
+const compaction = @import("../sstable/compaction.zig");
 const blob = @import("../storage/blob.zig");
 
 pub const MemTable = memtable_mod.MemTable;
@@ -188,6 +189,36 @@ pub const Engine = struct {
 
     pub fn sstableCount(self: *const Engine) usize {
         return self.sstables.items.len;
+    }
+
+    /// Full compaction: merge every SSTable into one, dropping dead
+    /// tombstones (safe because nothing remains below the merge frontier).
+    /// No-op when fewer than two SSTables exist.
+    pub fn compactAll(self: *Engine) Error!void {
+        if (self.sstables.items.len < 2) return;
+
+        // Gather readers in newest-first order (already the layout of
+        // self.sstables).
+        const readers = try self.gpa.alloc(*reader_mod.Reader, self.sstables.items.len);
+        defer self.gpa.free(readers);
+        for (self.sstables.items, 0..) |h, i| readers[i] = h.reader;
+
+        const merged = try compaction.compact(self.gpa, readers, .{
+            .target_block_size = self.options.target_block_size,
+            .expected_fp = self.options.expected_fp,
+            .drop_tombstones = true,
+        });
+        errdefer self.gpa.free(merged);
+
+        // Atomic-ish swap: tear down old SSTables, install merged. If
+        // openSSTable below fails, the engine is left without SSTables —
+        // memory-only. For v0 this is acceptable; a real implementation
+        // would stage the new SSTable first and only swap on success.
+        for (self.sstables.items) |*h| self.closeSSTable(h);
+        self.sstables.clearRetainingCapacity();
+
+        const handle = try self.openSSTable(merged);
+        try self.sstables.append(self.gpa, handle);
     }
 
     // ---- internals --------------------------------------------------------
@@ -420,4 +451,83 @@ test "Engine: flush is a no-op when nothing has been written" {
     defer e.deinit();
     try e.flush();
     try testing.expectEqual(@as(usize, 0), e.sstableCount());
+}
+
+test "Engine.compactAll: 3 SSTables collapse to 1, all live keys retained" {
+    const gpa = testing.allocator;
+    var e = try Engine.init(gpa, .{});
+    defer e.deinit();
+
+    // Tier 0
+    try e.set("a", "1");
+    try e.set("b", "2");
+    try e.flush();
+    // Tier 1
+    try e.set("c", "3");
+    try e.set("a", "1-new"); // shadows tier 0 a
+    try e.flush();
+    // Tier 2
+    try e.set("d", "4");
+    try e.flush();
+
+    try testing.expectEqual(@as(usize, 3), e.sstableCount());
+    try e.compactAll();
+    try testing.expectEqual(@as(usize, 1), e.sstableCount());
+
+    const a = (try e.get("a", gpa)).?;
+    defer gpa.free(a);
+    try testing.expectEqualStrings("1-new", a);
+
+    const b = (try e.get("b", gpa)).?;
+    defer gpa.free(b);
+    try testing.expectEqualStrings("2", b);
+
+    const c = (try e.get("c", gpa)).?;
+    defer gpa.free(c);
+    try testing.expectEqualStrings("3", c);
+
+    const d = (try e.get("d", gpa)).?;
+    defer gpa.free(d);
+    try testing.expectEqualStrings("4", d);
+}
+
+test "Engine.compactAll: tombstones for deleted keys are dropped" {
+    const gpa = testing.allocator;
+    var e = try Engine.init(gpa, .{});
+    defer e.deinit();
+
+    try e.set("k", "v");
+    try e.flush();
+    try e.delete("k");
+    try e.flush();
+
+    try testing.expectEqual(@as(usize, 2), e.sstableCount());
+    // After full compaction with drop_tombstones, the key should resolve
+    // to null still (dead) but the SSTable count drops to 1 and there is
+    // no tombstone occupying space.
+    try e.compactAll();
+    try testing.expectEqual(@as(usize, 1), e.sstableCount());
+    try testing.expectEqual(@as(?[]u8, null), try e.get("k", gpa));
+
+    // After resurrecting the key, it survives the next compaction.
+    try e.set("k", "back");
+    try e.flush();
+    try e.compactAll();
+    const got = (try e.get("k", gpa)).?;
+    defer gpa.free(got);
+    try testing.expectEqualStrings("back", got);
+}
+
+test "Engine.compactAll: no-op with 0 or 1 SSTables" {
+    const gpa = testing.allocator;
+    var e = try Engine.init(gpa, .{});
+    defer e.deinit();
+    try e.compactAll(); // 0 SSTables
+    try testing.expectEqual(@as(usize, 0), e.sstableCount());
+
+    try e.set("k", "v");
+    try e.flush();
+    try testing.expectEqual(@as(usize, 1), e.sstableCount());
+    try e.compactAll(); // 1 SSTable
+    try testing.expectEqual(@as(usize, 1), e.sstableCount());
 }

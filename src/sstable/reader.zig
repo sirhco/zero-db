@@ -130,6 +130,102 @@ pub const Reader = struct {
     }
 };
 
+/// One entry yielded by `ScanIterator`. `value == null` is a tombstone.
+/// `key` and `value` borrow into the iterator's currently-loaded data
+/// block; both are invalidated by the next call to `next()` or `deinit()`.
+pub const ScanEntry = struct {
+    key: []const u8,
+    value: ?[]const u8,
+};
+
+/// In-order iteration over every entry in an SSTable. Walks the index
+/// block then fetches each data block in turn, scanning entries within.
+/// Used by compaction to merge sorted streams from multiple SSTables.
+///
+/// Lifetime: returned `ScanEntry` slices reference the iterator's current
+/// data block buffer; consumers must copy out before calling `next()`
+/// again. The iterator owns one block buffer at a time, freeing it before
+/// loading the next.
+pub const ScanIterator = struct {
+    reader: *Reader,
+    f: footer_mod.Footer,
+    idx: index_mod.IndexBlock,
+    block_idx: u32 = 0,
+    block_buf: ?[]u8 = null,
+    block_pos: usize = 0,
+    payload_end: usize = 0,
+
+    pub fn deinit(it: *ScanIterator) void {
+        if (it.block_buf) |b| {
+            it.reader.gpa.free(b);
+            it.block_buf = null;
+        }
+    }
+
+    pub fn next(it: *ScanIterator) ReaderError!?ScanEntry {
+        while (true) {
+            // Need to load the next data block?
+            if (it.block_buf == null or it.block_pos >= it.payload_end) {
+                if (it.block_idx >= it.idx.count()) {
+                    it.deinit();
+                    return null;
+                }
+                if (it.block_buf) |b| {
+                    it.reader.gpa.free(b);
+                    it.block_buf = null;
+                }
+                const e = try it.idx.entryAt(it.block_idx);
+                it.block_idx += 1;
+
+                const buf = try it.reader.gpa.alloc(u8, e.block_size);
+                errdefer it.reader.gpa.free(buf);
+                const got = it.reader.storage.rangeGet(buf, e.block_offset, e.block_size) catch
+                    return error.BadDataBlock;
+                if (got != e.block_size) return error.ShortRead;
+
+                if (buf.len < data_block.DATA_BLOCK_HEADER_BYTES) return error.BadDataBlock;
+                const hdr_bytes: [data_block.DATA_BLOCK_HEADER_BYTES]u8 =
+                    buf[0..data_block.DATA_BLOCK_HEADER_BYTES].*;
+                const hdr: data_block.DataBlockHeader = @bitCast(hdr_bytes);
+                if (hdr.magic != data_block.DATA_BLOCK_MAGIC) return error.BadDataBlock;
+                if (hdr.version != data_block.DATA_BLOCK_VERSION) return error.BadDataBlock;
+
+                const payload_end = data_block.DATA_BLOCK_HEADER_BYTES + @as(usize, hdr.payload_size);
+                if (payload_end > buf.len) return error.BadDataBlock;
+
+                it.block_buf = buf;
+                it.block_pos = data_block.DATA_BLOCK_HEADER_BYTES;
+                it.payload_end = payload_end;
+            }
+
+            const buf = it.block_buf.?;
+            if (it.block_pos + 8 > it.payload_end) return error.BadDataBlock;
+            const klen = std.mem.readInt(u32, buf[it.block_pos..][0..4], .little);
+            const vlen = std.mem.readInt(u32, buf[it.block_pos + 4 ..][0..4], .little);
+            it.block_pos += 8;
+            if (it.block_pos + klen > it.payload_end) return error.BadDataBlock;
+            const k = buf[it.block_pos .. it.block_pos + klen];
+            it.block_pos += klen;
+            const is_tombstone = vlen == data_block.TOMBSTONE_VALUE_LEN;
+            const value_len_in_block: usize = if (is_tombstone) 0 else vlen;
+            if (it.block_pos + value_len_in_block > it.payload_end) return error.BadDataBlock;
+            const v: ?[]const u8 = if (is_tombstone) null else buf[it.block_pos .. it.block_pos + vlen];
+            it.block_pos += value_len_in_block;
+            return ScanEntry{ .key = k, .value = v };
+        }
+    }
+};
+
+/// Open an in-order scan over the entire SSTable. Lazily fetches data
+/// blocks via the underlying `Storage`. Caller must `deinit` the iterator
+/// (idempotent — `next` returning null also frees the trailing block).
+pub fn openScan(reader: *Reader) ReaderError!ScanIterator {
+    const f = try reader.loadFooter();
+    const idx_buf = try reader.loadIndex(f);
+    const idx = try index_mod.IndexBlock.parse(idx_buf);
+    return .{ .reader = reader, .f = f, .idx = idx };
+}
+
 /// Parse a data block buffer and linear-scan for `key`. Pure function — no
 /// IO, no allocation beyond the returned value's `out_gpa.dupe`. Exposed
 /// for testing and for the (future) block cache, which holds parsed
@@ -408,4 +504,48 @@ test "scanDataBlock: rejects buffer shorter than header" {
     const gpa = testing.allocator;
     const tiny = [_]u8{0} ** 4;
     try testing.expectError(error.BadDataBlock, scanDataBlock(&tiny, "x", gpa));
+}
+
+test "ScanIterator: walks every entry across multiple data blocks in order" {
+    const gpa = testing.allocator;
+
+    // Force multiple data blocks via small target_block_size.
+    var b = try writer.Builder.init(gpa, .{ .target_block_size = 32, .expected_entries = 16 });
+    defer b.deinit();
+    const inputs = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "alpha", .v = "1" },
+        .{ .k = "bravo", .v = null }, // tombstone
+        .{ .k = "charlie", .v = "3" },
+        .{ .k = "delta", .v = "4" },
+        .{ .k = "echo", .v = "5" },
+        .{ .k = "foxtrot", .v = null },
+    };
+    for (inputs) |i| {
+        if (i.v) |v| try b.add(i.k, v) else try b.addTombstone(i.k);
+    }
+    const sst = try b.finish();
+    defer gpa.free(sst);
+
+    var ms = blob.MemoryStorage.init(sst);
+    var r = Reader.init(gpa, ms.storage());
+    defer r.deinit();
+
+    var it = try openScan(&r);
+    defer it.deinit();
+
+    // Confirm we actually rolled multiple blocks.
+    const f = try footer_mod.parse(sst);
+    const idx = try index_mod.IndexBlock.parse(sst[f.index_offset .. f.index_offset + f.index_size]);
+    try testing.expect(idx.count() > 1);
+
+    var i: usize = 0;
+    while (try it.next()) |entry| : (i += 1) {
+        try testing.expectEqualStrings(inputs[i].k, entry.key);
+        if (inputs[i].v) |v| {
+            try testing.expectEqualStrings(v, entry.value.?);
+        } else {
+            try testing.expect(entry.value == null);
+        }
+    }
+    try testing.expectEqual(inputs.len, i);
 }

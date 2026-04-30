@@ -14,6 +14,7 @@ pub const sstable_footer = @import("sstable/footer.zig");
 pub const sstable_reader = @import("sstable/reader.zig");
 pub const sstable_writer = @import("sstable/writer.zig");
 pub const sstable_data_block = @import("sstable/data_block.zig");
+pub const sstable_compaction = @import("sstable/compaction.zig");
 
 pub const engine = @import("engine/engine.zig");
 pub const memtable = @import("engine/memtable.zig");
@@ -66,6 +67,7 @@ test {
     _ = @import("sstable/reader.zig");
     _ = @import("sstable/writer.zig");
     _ = @import("sstable/data_block.zig");
+    _ = @import("sstable/compaction.zig");
     _ = @import("engine/engine.zig");
     _ = @import("engine/memtable.zig");
     _ = @import("engine/compaction.zig");
