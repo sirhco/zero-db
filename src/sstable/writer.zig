@@ -261,46 +261,16 @@ pub fn writeFromMemTable(
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;
+const reader = @import("reader.zig");
+const blob = @import("../storage/blob.zig");
 
-/// Locate the data block in `sst` that the index resolves `key` to, and
-/// scan its entries for an exact key match. Used by every roundtrip test
-/// in this file; later this lives in `reader.zig`.
-fn lookupKey(sst: []const u8, key: []const u8) !?struct { value: ?[]const u8 } {
-    // Footer is always the last 64 bytes.
-    const f = try footer_mod.parse(sst);
-
-    // Index block.
-    const idx_buf = sst[f.index_offset .. f.index_offset + f.index_size];
-    const idx = try index_mod.IndexBlock.parse(idx_buf);
-    const loc = (try idx.find(key)) orelse return null;
-
-    // Data block.
-    const block_buf = sst[loc.block_offset .. loc.block_offset + loc.block_size];
-    if (block_buf.len < data_block.DATA_BLOCK_HEADER_BYTES) return error.BadBlock;
-    const hdr_bytes: [data_block.DATA_BLOCK_HEADER_BYTES]u8 =
-        block_buf[0..data_block.DATA_BLOCK_HEADER_BYTES].*;
-    const hdr: data_block.DataBlockHeader = @bitCast(hdr_bytes);
-    if (hdr.magic != data_block.DATA_BLOCK_MAGIC) return error.BadBlock;
-
-    var off: usize = data_block.DATA_BLOCK_HEADER_BYTES;
-    const end: usize = data_block.DATA_BLOCK_HEADER_BYTES + hdr.payload_size;
-    while (off < end) {
-        const klen = std.mem.readInt(u32, block_buf[off..][0..4], .little);
-        const vlen = std.mem.readInt(u32, block_buf[off + 4 ..][0..4], .little);
-        off += 8;
-        const k = block_buf[off .. off + klen];
-        off += klen;
-        const is_tombstone = vlen == data_block.TOMBSTONE_VALUE_LEN;
-        const v: ?[]const u8 = if (is_tombstone) null else block_buf[off .. off + vlen];
-        if (!is_tombstone) off += vlen;
-        if (std.mem.eql(u8, k, key)) {
-            return .{ .value = v };
-        }
-    }
-    return null;
+/// Test helper: open a Reader against an in-memory SSTable buffer.
+fn openReader(gpa: std.mem.Allocator, sst: []const u8, ms_out: *blob.MemoryStorage) reader.Reader {
+    ms_out.* = blob.MemoryStorage.init(sst);
+    return reader.Reader.init(gpa, ms_out.storage());
 }
 
-test "Builder: simple roundtrip via index + data block scan" {
+test "Builder: simple roundtrip via Reader" {
     const gpa = testing.allocator;
     var b = try Builder.init(gpa, .{ .expected_entries = 16 });
     defer b.deinit();
@@ -313,17 +283,22 @@ test "Builder: simple roundtrip via index + data block scan" {
     const sst = try b.finish();
     defer gpa.free(sst);
 
-    const a = try lookupKey(sst, "alpha");
-    try testing.expectEqualStrings("AAA", a.?.value.?);
+    var ms: blob.MemoryStorage = undefined;
+    var r = openReader(gpa, sst, &ms);
+    defer r.deinit();
 
-    const c = try lookupKey(sst, "charlie");
-    try testing.expectEqualStrings("CCCC", c.?.value.?);
+    const a = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a.present);
+    try testing.expectEqualStrings("AAA", a.present);
 
-    const miss = try lookupKey(sst, "zzz");
-    try testing.expectEqual(@as(?@TypeOf(miss.?), null), miss);
+    const c = (try r.get("charlie", gpa)).?;
+    defer gpa.free(c.present);
+    try testing.expectEqualStrings("CCCC", c.present);
+
+    try testing.expectEqual(@as(?reader.Lookup, null), try r.get("zzz", gpa));
 }
 
-test "Builder: tombstones survive roundtrip with null value" {
+test "Builder: tombstones survive roundtrip" {
     const gpa = testing.allocator;
     var b = try Builder.init(gpa, .{ .expected_entries = 4 });
     defer b.deinit();
@@ -335,12 +310,16 @@ test "Builder: tombstones survive roundtrip with null value" {
     const sst = try b.finish();
     defer gpa.free(sst);
 
-    const got_b = try lookupKey(sst, "bravo");
-    try testing.expect(got_b != null);
-    try testing.expect(got_b.?.value == null); // tombstone
+    var ms: blob.MemoryStorage = undefined;
+    var r = openReader(gpa, sst, &ms);
+    defer r.deinit();
 
-    const got_a = try lookupKey(sst, "alpha");
-    try testing.expectEqualStrings("alive", got_a.?.value.?);
+    const tomb = (try r.get("bravo", gpa)).?;
+    try testing.expectEqual(reader.Lookup.tombstone, tomb);
+
+    const a = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a.present);
+    try testing.expectEqualStrings("alive", a.present);
 }
 
 test "Builder: unsorted input is rejected" {
@@ -372,9 +351,13 @@ test "Builder: small target_block_size forces multiple data blocks" {
     try testing.expect(idx.count() > 1);
 
     // Every key still resolvable through the multi-block index.
+    var ms: blob.MemoryStorage = undefined;
+    var r = openReader(gpa, sst, &ms);
+    defer r.deinit();
     for (keys) |k| {
-        const got = try lookupKey(sst, k);
-        try testing.expectEqualStrings("value-bytes", got.?.value.?);
+        const got = (try r.get(k, gpa)).?;
+        defer gpa.free(got.present);
+        try testing.expectEqualStrings("value-bytes", got.present);
     }
 }
 
@@ -411,7 +394,7 @@ test "Builder: bloom filter recognizes inserted keys" {
     try testing.expect(filter.maybeContains("charlie"));
 }
 
-test "writeFromMemTable: end-to-end MemTable → SSTable → lookup" {
+test "writeFromMemTable: end-to-end MemTable → SSTable → Reader" {
     const gpa = testing.allocator;
     var mt = try memtable_mod.MemTable.init(gpa);
     defer mt.deinit();
@@ -427,24 +410,33 @@ test "writeFromMemTable: end-to-end MemTable → SSTable → lookup" {
     const sst = try writeFromMemTable(gpa, &mt, .{ .target_block_size = 64 });
     defer gpa.free(sst);
 
-    // Footer + bloom say expected count.
     const f = try footer_mod.parse(sst);
     try testing.expectEqual(@as(u64, 5), f.entry_count);
 
-    // Each key resolves; tombstone resolves as null value.
-    const a = try lookupKey(sst, "alpha");
-    try testing.expectEqualStrings("a-val", a.?.value.?);
-    const m = try lookupKey(sst, "mango");
-    try testing.expectEqualStrings("m-val", m.?.value.?);
-    const z = try lookupKey(sst, "zeta");
-    try testing.expectEqualStrings("z-val", z.?.value.?);
-    const d = try lookupKey(sst, "delta");
-    try testing.expectEqualStrings("d-val", d.?.value.?);
-    const b = try lookupKey(sst, "bravo");
-    try testing.expect(b.?.value == null);
+    var ms: blob.MemoryStorage = undefined;
+    var r = openReader(gpa, sst, &ms);
+    defer r.deinit();
 
-    const miss = try lookupKey(sst, "nonexistent");
-    try testing.expect(miss == null or miss.?.value != null); // index lower-bound may resolve to a block, but the scan finds no match.
+    const a = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a.present);
+    try testing.expectEqualStrings("a-val", a.present);
+
+    const m = (try r.get("mango", gpa)).?;
+    defer gpa.free(m.present);
+    try testing.expectEqualStrings("m-val", m.present);
+
+    const z = (try r.get("zeta", gpa)).?;
+    defer gpa.free(z.present);
+    try testing.expectEqualStrings("z-val", z.present);
+
+    const d = (try r.get("delta", gpa)).?;
+    defer gpa.free(d.present);
+    try testing.expectEqualStrings("d-val", d.present);
+
+    const tomb = (try r.get("bravo", gpa)).?;
+    try testing.expectEqual(reader.Lookup.tombstone, tomb);
+
+    try testing.expectEqual(@as(?reader.Lookup, null), try r.get("nonexistent", gpa));
 }
 
 test "writeFromMemTable: 500-key roundtrip across many blocks" {
@@ -470,12 +462,17 @@ test "writeFromMemTable: 500-key roundtrip across many blocks" {
     const sst = try writeFromMemTable(gpa, &mt, .{ .target_block_size = 256 });
     defer gpa.free(sst);
 
+    var ms: blob.MemoryStorage = undefined;
+    var r = openReader(gpa, sst, &ms);
+    defer r.deinit();
+
     // Spot-check: first, last, a few in the middle.
     const probes = [_]u32{ 0, 1, 17, 250, 498, 499 };
     for (probes) |p| {
-        const got = try lookupKey(sst, keys.items[p]);
+        const got = (try r.get(keys.items[p], gpa)).?;
+        defer gpa.free(got.present);
         var expect_buf: [32]u8 = undefined;
         const want = try std.fmt.bufPrint(&expect_buf, "v_{d}", .{p});
-        try testing.expectEqualStrings(want, got.?.value.?);
+        try testing.expectEqualStrings(want, got.present);
     }
 }
