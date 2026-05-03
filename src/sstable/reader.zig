@@ -16,7 +16,9 @@ const std = @import("std");
 
 const blob = @import("../storage/blob.zig");
 const bloom = @import("../bloom/filter.zig");
+const crc_mod = @import("../util/crc.zig");
 const data_block = @import("data_block.zig");
+const fmt = @import("format.zig");
 const footer_mod = @import("footer.zig");
 const index_mod = @import("index.zig");
 
@@ -42,6 +44,18 @@ pub const Lookup = union(enum) {
     /// through to lower-level SSTables for this key.
     tombstone,
 };
+
+/// Strip and verify the 4-byte little-endian CRC32C trailer the writer
+/// appends to every data block. Returns the payload slice (`buf` minus
+/// trailer). `error.BadDataBlock` if `buf` is shorter than the trailer or
+/// the recomputed CRC does not match.
+fn verifyDataBlock(buf: []const u8) error{BadDataBlock}![]const u8 {
+    if (buf.len < fmt.DATA_BLOCK_CRC_LEN) return error.BadDataBlock;
+    const payload = buf[0 .. buf.len - fmt.DATA_BLOCK_CRC_LEN];
+    const want = std.mem.readInt(u32, buf[buf.len - fmt.DATA_BLOCK_CRC_LEN ..][0..4], .little);
+    if (crc_mod.crc32c(payload) != want) return error.BadDataBlock;
+    return payload;
+}
 
 pub const Reader = struct {
     gpa: std.mem.Allocator,
@@ -88,7 +102,8 @@ pub const Reader = struct {
             return error.BadDataBlock;
         if (got != loc.block_size) return error.ShortRead;
 
-        return scanDataBlock(block_buf, key, out_gpa);
+        const payload = try verifyDataBlock(block_buf);
+        return scanDataBlock(payload, key, out_gpa);
     }
 
     fn loadFooter(self: *Reader) ReaderError!footer_mod.Footer {
@@ -183,15 +198,16 @@ pub const ScanIterator = struct {
                     return error.BadDataBlock;
                 if (got != e.block_size) return error.ShortRead;
 
-                if (buf.len < data_block.DATA_BLOCK_HEADER_BYTES) return error.BadDataBlock;
+                const payload = try verifyDataBlock(buf);
+                if (payload.len < data_block.DATA_BLOCK_HEADER_BYTES) return error.BadDataBlock;
                 const hdr_bytes: [data_block.DATA_BLOCK_HEADER_BYTES]u8 =
-                    buf[0..data_block.DATA_BLOCK_HEADER_BYTES].*;
+                    payload[0..data_block.DATA_BLOCK_HEADER_BYTES].*;
                 const hdr: data_block.DataBlockHeader = @bitCast(hdr_bytes);
                 if (hdr.magic != data_block.DATA_BLOCK_MAGIC) return error.BadDataBlock;
                 if (hdr.version != data_block.DATA_BLOCK_VERSION) return error.BadDataBlock;
 
                 const payload_end = data_block.DATA_BLOCK_HEADER_BYTES + @as(usize, hdr.payload_size);
-                if (payload_end > buf.len) return error.BadDataBlock;
+                if (payload_end > payload.len) return error.BadDataBlock;
 
                 it.block_buf = buf;
                 it.block_pos = data_block.DATA_BLOCK_HEADER_BYTES;
@@ -548,4 +564,34 @@ test "ScanIterator: walks every entry across multiple data blocks in order" {
         }
     }
     try testing.expectEqual(inputs.len, i);
+}
+
+test "reader returns BadDataBlock when CRC trailer mismatches payload" {
+    const gpa = testing.allocator;
+
+    var b = try writer.Builder.init(gpa, .{ .expected_entries = 4 });
+    defer b.deinit();
+    try b.add("alpha", "AAA");
+    try b.add("bravo", "BB");
+    var sst = try b.finish();
+    defer gpa.free(sst);
+
+    const f = try footer_mod.parse(sst);
+    const idx = try index_mod.IndexBlock.parse(sst[f.index_offset .. f.index_offset + f.index_size]);
+    const first = try idx.entryAt(0);
+    // Flip the first byte of the payload (definitely covered by the CRC).
+    sst[first.block_offset] ^= 0xFF;
+
+    var ms = blob.MemoryStorage.init(sst);
+    var r = Reader.init(gpa, ms.storage());
+    defer r.deinit();
+
+    try testing.expectError(error.BadDataBlock, r.get("alpha", gpa));
+}
+
+test "verifyDataBlock rejects buffers shorter than the trailer" {
+    var tiny: [3]u8 = .{ 0, 0, 0 };
+    try testing.expectError(error.BadDataBlock, verifyDataBlock(&tiny));
+    var empty: [0]u8 = .{};
+    try testing.expectError(error.BadDataBlock, verifyDataBlock(&empty));
 }

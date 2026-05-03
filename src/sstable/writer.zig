@@ -17,6 +17,7 @@ const footer_mod = @import("footer.zig");
 const bloom = @import("../bloom/filter.zig");
 const memtable_mod = @import("../engine/memtable.zig");
 const fmt = @import("format.zig");
+const crc_mod = @import("../util/crc.zig");
 
 pub const Error = error{
     UnsortedKeys,
@@ -153,6 +154,16 @@ pub const Builder = struct {
         const block_offset: u64 = self.out.items.len;
         try self.out.appendSlice(self.gpa, &hdr_bytes);
         try self.out.appendSlice(self.gpa, self.block_buf.items);
+
+        // Compute CRC32C over the block payload (header + entries) and append
+        // a 4-byte little-endian trailer. block_size recorded in the index
+        // must span payload + trailer so the reader can locate and strip it.
+        const payload_view = self.out.items[block_offset..];
+        const crc_value = crc_mod.crc32c(payload_view);
+        var crc_bytes: [fmt.DATA_BLOCK_CRC_LEN]u8 = undefined;
+        std.mem.writeInt(u32, &crc_bytes, crc_value, .little);
+        try self.out.appendSlice(self.gpa, &crc_bytes);
+
         const block_size_usize: usize = self.out.items.len - block_offset;
         if (block_size_usize > std.math.maxInt(u32)) return error.HeapTooLarge;
 
@@ -474,5 +485,38 @@ test "writeFromMemTable: 500-key roundtrip across many blocks" {
         var expect_buf: [32]u8 = undefined;
         const want = try std.fmt.bufPrint(&expect_buf, "v_{d}", .{p});
         try testing.expectEqualStrings(want, got.present);
+    }
+}
+
+test "writer appends CRC32C trailer to each data block" {
+    const gpa = testing.allocator;
+
+    // Force one block per entry by setting target_block_size below a single
+    // packed entry. Verifies the trailer is emitted per-block, not just
+    // once at SSTable finalization.
+    var b = try Builder.init(gpa, .{ .expected_entries = 8, .target_block_size = 16 });
+    defer b.deinit();
+    try b.add("alpha", "AAA");
+    try b.add("bravo", "BBBB");
+    try b.add("charlie", "CCCCC");
+    try b.add("delta", "DDDDDD");
+    const sst = try b.finish();
+    defer gpa.free(sst);
+
+    const f = try footer_mod.parse(sst);
+    const idx = try index_mod.IndexBlock.parse(sst[f.index_offset .. f.index_offset + f.index_size]);
+    try testing.expectEqual(@as(u32, 4), idx.count()); // each add() rolls a fresh block
+
+    var i: u32 = 0;
+    while (i < idx.count()) : (i += 1) {
+        const entry = try idx.entryAt(i);
+        const block_full = sst[entry.block_offset..][0..entry.block_size];
+        try testing.expect(block_full.len > fmt.DATA_BLOCK_CRC_LEN);
+
+        const payload = block_full[0 .. block_full.len - fmt.DATA_BLOCK_CRC_LEN];
+        const trailer = block_full[block_full.len - fmt.DATA_BLOCK_CRC_LEN ..];
+        const want = crc_mod.crc32c(payload);
+        const got = std.mem.readInt(u32, trailer[0..4], .little);
+        try testing.expectEqual(want, got);
     }
 }
