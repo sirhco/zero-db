@@ -56,6 +56,14 @@ comptime {
     std.debug.assert(INDEX_ENTRY_HEADER_BYTES == 14);
 }
 
+/// Length of the CRC32C trailer appended to each data block on disk.
+/// Layout: `[block payload bytes][crc32c little-endian u32]`.
+pub const DATA_BLOCK_CRC_LEN: usize = 4;
+
+comptime {
+    std.debug.assert(DATA_BLOCK_CRC_LEN == @sizeOf(u32));
+}
+
 test "format constants stable" {
     try std.testing.expectEqual(@as(u32, 0x5844495A), INDEX_BLOCK_MAGIC);
     try std.testing.expectEqual(@as(u16, 1), INDEX_BLOCK_VERSION);
