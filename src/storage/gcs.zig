@@ -1,0 +1,518 @@
+//! Google Cloud Storage client.
+//!
+//! Issues `GET` against `https://storage.googleapis.com/<bucket>/<object>`
+//! with a `Range: bytes=A-B` header. The actual HTTP transport is hidden
+//! behind the `HttpTransport` vtable so:
+//!   - production wires `std.http.Client` (a future `RealTransport`)
+//!   - tests use `FakeTransport` / `FakeServer` to verify URL + headers +
+//!     response handling end-to-end without network or credentials
+//!
+//! Auth (bearer-token from `auth.zig`) is not yet wired here — `Client`
+//! optionally accepts a token and emits an `Authorization: Bearer <token>`
+//! header when one is set; production token refresh lives in `auth.zig`.
+
+const std = @import("std");
+
+pub const Error = error{
+    EmptyRange,
+    InvalidObject,
+    HttpError,
+    BadStatus,
+    AuthFailed,
+    BodyTooLarge,
+    OutOfMemory,
+    UrlBufferTooSmall,
+    NotImplemented,
+};
+
+pub const DEFAULT_BASE_URL: []const u8 = "https://storage.googleapis.com";
+
+pub const Header = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const Response = struct {
+    status: u16,
+    /// Bytes the transport wrote into the caller-provided `body_dst`.
+    body_len: usize,
+};
+
+/// Pluggable HTTP transport. Anything that can answer `GET <url> + headers`
+/// by populating a `body_dst` buffer satisfies this interface.
+pub const HttpTransport = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Synchronous GET. Implementations write up to `body_dst.len` body
+        /// bytes into `body_dst` and return the actual count via
+        /// `Response.body_len`. Status is the HTTP status code.
+        get: *const fn (ptr: *anyopaque, url: []const u8, headers: []const Header, body_dst: []u8) anyerror!Response,
+    };
+
+    pub fn get(self: HttpTransport, url: []const u8, headers: []const Header, body_dst: []u8) anyerror!Response {
+        return self.vtable.get(self.ptr, url, headers, body_dst);
+    }
+};
+
+pub const Options = struct {
+    /// Override for tests / staging. Must NOT have a trailing slash.
+    base_url: []const u8 = DEFAULT_BASE_URL,
+    /// Optional bearer token. When set, every request carries
+    /// `Authorization: Bearer <token>`. Lifetime: borrowed; caller keeps
+    /// the token string alive.
+    bearer_token: ?[]const u8 = null,
+};
+
+pub const Client = struct {
+    gpa: std.mem.Allocator,
+    transport: HttpTransport,
+    options: Options,
+
+    pub fn init(gpa: std.mem.Allocator, transport: HttpTransport, options: Options) Client {
+        return .{ .gpa = gpa, .transport = transport, .options = options };
+    }
+
+    pub fn deinit(self: *Client) void {
+        _ = self;
+    }
+
+    /// `GET <base>/<bucket>/<object>` with `Range: bytes=start-(start+len-1)`.
+    /// Writes up to `len` bytes into `dst`; returns actual count from the
+    /// server response. `len` must be `<= dst.len`.
+    pub fn rangeGet(
+        self: *Client,
+        bucket: []const u8,
+        object: []const u8,
+        start: u64,
+        len: u32,
+        dst: []u8,
+    ) Error!usize {
+        if (len == 0) return error.EmptyRange;
+        std.debug.assert(len <= dst.len);
+
+        // URL — we own the buffer for the duration of the call.
+        var url_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer url_arena.deinit();
+        const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
+            return error.InvalidObject;
+
+        // Range header. Stack-allocated; lives through transport.get.
+        var range_buf: [64]u8 = undefined;
+        const range_value = formatRangeHeader(&range_buf, start, len) catch return error.EmptyRange;
+
+        // Optional Authorization. Allocate a small buffer on the stack
+        // sized for a typical OAuth2 access token.
+        var auth_buf: [512]u8 = undefined;
+        var auth_value: ?[]const u8 = null;
+        if (self.options.bearer_token) |t| {
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
+                return error.AuthFailed;
+        }
+
+        var headers: [2]Header = undefined;
+        var n: usize = 1;
+        headers[0] = .{ .name = "Range", .value = range_value };
+        if (auth_value) |av| {
+            headers[1] = .{ .name = "Authorization", .value = av };
+            n = 2;
+        }
+
+        const resp = self.transport.get(url, headers[0..n], dst[0..len]) catch
+            return error.HttpError;
+
+        // GCS returns 200 (full object, when our range covers it all) or
+        // 206 (partial content) on success. Anything else is a failure.
+        if (resp.status != 200 and resp.status != 206) {
+            return switch (resp.status) {
+                401, 403 => error.AuthFailed,
+                else => error.BadStatus,
+            };
+        }
+        return resp.body_len;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// URL + Range header helpers (pure; tested directly).
+// ---------------------------------------------------------------------------
+
+pub fn appendUrlEncoded(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    for (s) |c| {
+        if (isUnreserved(c) or c == '/') {
+            try out.append(gpa, c);
+        } else {
+            try out.print(gpa, "%{X:0>2}", .{c});
+        }
+    }
+}
+
+fn isUnreserved(c: u8) bool {
+    return (c >= 'A' and c <= 'Z') or
+        (c >= 'a' and c <= 'z') or
+        (c >= '0' and c <= '9') or
+        c == '-' or c == '_' or c == '.' or c == '~';
+}
+
+pub fn buildObjectUrl(
+    gpa: std.mem.Allocator,
+    base_url: []const u8,
+    bucket: []const u8,
+    object: []const u8,
+) Error![]u8 {
+    if (object.len == 0) return error.InvalidObject;
+    if (object[0] == '/') return error.InvalidObject;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+
+    out.appendSlice(gpa, base_url) catch return error.OutOfMemory;
+    out.append(gpa, '/') catch return error.OutOfMemory;
+    appendUrlEncoded(&out, gpa, bucket) catch return error.OutOfMemory;
+    out.append(gpa, '/') catch return error.OutOfMemory;
+    appendUrlEncoded(&out, gpa, object) catch return error.OutOfMemory;
+    return out.toOwnedSlice(gpa) catch return error.OutOfMemory;
+}
+
+pub fn formatRangeHeader(out: []u8, start: u64, len: u32) Error![]const u8 {
+    if (len == 0) return error.EmptyRange;
+    const end_inclusive: u64 = start + len - 1;
+    return std.fmt.bufPrint(out, "bytes={d}-{d}", .{ start, end_inclusive }) catch
+        return error.OutOfMemory;
+}
+
+/// Parse a `Range: bytes=A-B` header value. Returns (start, inclusive_end).
+/// Used by `FakeServer` and by future cache-aware transports.
+pub fn parseRangeValue(value: []const u8) !struct { start: u64, end: u64 } {
+    const prefix = "bytes=";
+    if (!std.mem.startsWith(u8, value, prefix)) return error.BadRange;
+    const rest = value[prefix.len..];
+    const dash = std.mem.indexOfScalar(u8, rest, '-') orelse return error.BadRange;
+    const start = try std.fmt.parseInt(u64, rest[0..dash], 10);
+    const end = try std.fmt.parseInt(u64, rest[dash + 1 ..], 10);
+    if (end < start) return error.BadRange;
+    return .{ .start = start, .end = end };
+}
+
+fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// FakeServer — in-memory GCS impostor for testing.
+// ---------------------------------------------------------------------------
+
+/// Minimal in-memory GCS impostor for unit tests. Serves byte ranges of
+/// one configured object; records the most recent request so tests can
+/// assert URL + headers were built correctly. NOT a general-purpose mock —
+/// just enough surface area to drive the `Client.rangeGet` happy path,
+/// auth path, and a few error paths.
+///
+/// FakeServer owns gpa-allocated copies of the URL and Authorization
+/// strings it observes so tests can assert against them after the call
+/// returns (the caller's URL buffer may be a stack-local arena that goes
+/// out of scope before the test inspects state).
+pub const FakeServer = struct {
+    gpa: std.mem.Allocator,
+    base_url: []const u8,
+    bucket: []const u8,
+    object: []const u8,
+    object_bytes: []const u8,
+
+    /// When set, requests must carry `Authorization: Bearer <expected>`;
+    /// missing / mismatched tokens return 401.
+    expected_token: ?[]const u8 = null,
+
+    /// Force a specific status on the next call (cleared afterwards).
+    /// Used to exercise non-2xx error paths without contorting the
+    /// happy-path setup.
+    forced_status: ?u16 = null,
+
+    // Recorded request data — gpa-owned dupes; freed in deinit.
+    last_url: ?[]u8 = null,
+    last_auth_seen: ?[]u8 = null,
+    last_range_start: u64 = 0,
+    last_range_end: u64 = 0,
+    last_range_header_seen: bool = false,
+    call_count: u32 = 0,
+
+    pub fn init(
+        gpa: std.mem.Allocator,
+        base_url: []const u8,
+        bucket: []const u8,
+        object: []const u8,
+        object_bytes: []const u8,
+    ) FakeServer {
+        return .{
+            .gpa = gpa,
+            .base_url = base_url,
+            .bucket = bucket,
+            .object = object,
+            .object_bytes = object_bytes,
+        };
+    }
+
+    pub fn deinit(self: *FakeServer) void {
+        if (self.last_url) |u| self.gpa.free(u);
+        if (self.last_auth_seen) |a| self.gpa.free(a);
+        self.* = undefined;
+    }
+
+    pub fn transport(self: *FakeServer) HttpTransport {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    const vtable: HttpTransport.VTable = .{ .get = getImpl };
+
+    fn recordUrl(self: *FakeServer, url: []const u8) !void {
+        if (self.last_url) |u| self.gpa.free(u);
+        self.last_url = try self.gpa.dupe(u8, url);
+    }
+
+    fn recordAuth(self: *FakeServer, auth: ?[]const u8) !void {
+        if (self.last_auth_seen) |a| self.gpa.free(a);
+        self.last_auth_seen = if (auth) |x| try self.gpa.dupe(u8, x) else null;
+    }
+
+    fn getImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+        body_dst: []u8,
+    ) anyerror!Response {
+        const self: *FakeServer = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+        try self.recordUrl(url);
+        try self.recordAuth(findHeader(headers, "Authorization"));
+        self.last_range_header_seen = false;
+
+        // URL must match base + bucket + object exactly.
+        var expected_buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&expected_buf);
+        const expected = buildObjectUrl(fba.allocator(), self.base_url, self.bucket, self.object) catch
+            return error.OutOfMemory;
+        if (!std.mem.eql(u8, url, expected)) return Response{ .status = 404, .body_len = 0 };
+
+        // Auth check, if configured.
+        if (self.expected_token) |want| {
+            const got = self.last_auth_seen orelse return Response{ .status = 401, .body_len = 0 };
+            const prefix = "Bearer ";
+            if (!std.mem.startsWith(u8, got, prefix) or
+                !std.mem.eql(u8, got[prefix.len..], want))
+            {
+                return Response{ .status = 401, .body_len = 0 };
+            }
+        }
+
+        // Forced-error escape hatch.
+        if (self.forced_status) |s| {
+            self.forced_status = null;
+            return Response{ .status = s, .body_len = 0 };
+        }
+
+        // Range header is required (this fake only supports range reads).
+        const range_value = findHeader(headers, "Range") orelse
+            return Response{ .status = 400, .body_len = 0 };
+        const r = try parseRangeValue(range_value);
+        self.last_range_header_seen = true;
+        self.last_range_start = r.start;
+        self.last_range_end = r.end;
+
+        // Slice the requested span out of the object bytes.
+        if (r.start >= self.object_bytes.len) return Response{ .status = 416, .body_len = 0 };
+        const end_clamped: usize = @intCast(@min(r.end, @as(u64, self.object_bytes.len) - 1));
+        const want_len: usize = end_clamped - @as(usize, @intCast(r.start)) + 1;
+        const n: usize = @min(want_len, body_dst.len);
+        const s: usize = @intCast(r.start);
+        @memcpy(body_dst[0..n], self.object_bytes[s .. s + n]);
+        return Response{ .status = 206, .body_len = n };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "buildObjectUrl: simple case" {
+    const gpa = testing.allocator;
+    const url = try buildObjectUrl(gpa, DEFAULT_BASE_URL, "my-bucket", "path/to/object.sst");
+    defer gpa.free(url);
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/my-bucket/path/to/object.sst",
+        url,
+    );
+}
+
+test "buildObjectUrl: encodes special chars but preserves slashes" {
+    const gpa = testing.allocator;
+    const url = try buildObjectUrl(gpa, DEFAULT_BASE_URL, "bk", "tenants/acme corp/file?x.sst");
+    defer gpa.free(url);
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/bk/tenants/acme%20corp/file%3Fx.sst",
+        url,
+    );
+}
+
+test "buildObjectUrl: percent-encodes UTF-8 byte by byte" {
+    const gpa = testing.allocator;
+    const url = try buildObjectUrl(gpa, DEFAULT_BASE_URL, "b", "café.sst");
+    defer gpa.free(url);
+    try testing.expectEqualStrings(
+        "https://storage.googleapis.com/b/caf%C3%A9.sst",
+        url,
+    );
+}
+
+test "buildObjectUrl: rejects empty / leading-slash object" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.InvalidObject, buildObjectUrl(gpa, DEFAULT_BASE_URL, "b", ""));
+    try testing.expectError(error.InvalidObject, buildObjectUrl(gpa, DEFAULT_BASE_URL, "b", "/oops"));
+}
+
+test "formatRangeHeader: standard inclusive range" {
+    var buf: [64]u8 = undefined;
+    const h = try formatRangeHeader(&buf, 0, 1024);
+    try testing.expectEqualStrings("bytes=0-1023", h);
+}
+
+test "formatRangeHeader: 1-byte range" {
+    var buf: [64]u8 = undefined;
+    const h = try formatRangeHeader(&buf, 100, 1);
+    try testing.expectEqualStrings("bytes=100-100", h);
+}
+
+test "formatRangeHeader: zero-length is rejected" {
+    var buf: [64]u8 = undefined;
+    try testing.expectError(error.EmptyRange, formatRangeHeader(&buf, 0, 0));
+}
+
+test "parseRangeValue: roundtrip" {
+    const r = try parseRangeValue("bytes=100-199");
+    try testing.expectEqual(@as(u64, 100), r.start);
+    try testing.expectEqual(@as(u64, 199), r.end);
+}
+
+test "parseRangeValue: rejects non-bytes prefix" {
+    try testing.expectError(error.BadRange, parseRangeValue("items=0-9"));
+}
+
+test "FakeServer: serves a partial range with status 206" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, "http://test.local", "b", "o", "0123456789abcdef");
+    defer fs.deinit();
+    const t = fs.transport();
+
+    var dst: [4]u8 = undefined;
+    const headers = [_]Header{.{ .name = "Range", .value = "bytes=4-7" }};
+    const r = try t.get("http://test.local/b/o", &headers, &dst);
+    try testing.expectEqual(@as(u16, 206), r.status);
+    try testing.expectEqual(@as(usize, 4), r.body_len);
+    try testing.expectEqualSlices(u8, "4567", &dst);
+    try testing.expectEqual(@as(u32, 1), fs.call_count);
+}
+
+test "FakeServer: 401 when token missing" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, "http://t", "b", "o", "abc");
+    defer fs.deinit();
+    fs.expected_token = "secret";
+    const t = fs.transport();
+    var dst: [4]u8 = undefined;
+    const headers = [_]Header{.{ .name = "Range", .value = "bytes=0-2" }};
+    const r = try t.get("http://t/b/o", &headers, &dst);
+    try testing.expectEqual(@as(u16, 401), r.status);
+}
+
+test "FakeServer: 200/206 when token correct" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, "http://t", "b", "o", "abc");
+    defer fs.deinit();
+    fs.expected_token = "secret";
+    const t = fs.transport();
+    var dst: [4]u8 = undefined;
+    const headers = [_]Header{
+        .{ .name = "Range", .value = "bytes=0-2" },
+        .{ .name = "Authorization", .value = "Bearer secret" },
+    };
+    const r = try t.get("http://t/b/o", &headers, &dst);
+    try testing.expectEqual(@as(u16, 206), r.status);
+    try testing.expectEqualSlices(u8, "abc", dst[0..3]);
+}
+
+test "FakeServer: 404 on URL mismatch" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, "http://t", "b", "o", "x");
+    defer fs.deinit();
+    const t = fs.transport();
+    var dst: [1]u8 = undefined;
+    const headers = [_]Header{.{ .name = "Range", .value = "bytes=0-0" }};
+    const r = try t.get("http://t/b/wrong", &headers, &dst);
+    try testing.expectEqual(@as(u16, 404), r.status);
+}
+
+test "Client.rangeGet: builds URL + Range, writes response into dst" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "obj.sst", "abcdefghijklmnop");
+    defer fs.deinit();
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    var dst: [8]u8 = undefined;
+    const n = try c.rangeGet("bk", "obj.sst", 4, 8, &dst);
+    try testing.expectEqual(@as(usize, 8), n);
+    try testing.expectEqualSlices(u8, "efghijkl", &dst);
+    try testing.expect(fs.last_range_header_seen);
+    try testing.expectEqual(@as(u64, 4), fs.last_range_start);
+    try testing.expectEqual(@as(u64, 11), fs.last_range_end);
+    try testing.expectEqualStrings("https://storage.googleapis.com/bk/obj.sst", fs.last_url.?);
+    try testing.expect(fs.last_auth_seen == null);
+}
+
+test "Client.rangeGet: emits Authorization when bearer_token set" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "o", "abc");
+    defer fs.deinit();
+    fs.expected_token = "tok-12345";
+    var c = Client.init(gpa, fs.transport(), .{ .bearer_token = "tok-12345" });
+    defer c.deinit();
+
+    var dst: [3]u8 = undefined;
+    _ = try c.rangeGet("bk", "o", 0, 3, &dst);
+    try testing.expect(fs.last_auth_seen != null);
+    try testing.expectEqualStrings("Bearer tok-12345", fs.last_auth_seen.?);
+}
+
+test "Client.rangeGet: maps 401 → AuthFailed, 500 → BadStatus" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "o", "abc");
+    defer fs.deinit();
+    fs.expected_token = "secret";
+
+    var c = Client.init(gpa, fs.transport(), .{}); // no token
+    defer c.deinit();
+
+    var dst: [3]u8 = undefined;
+    try testing.expectError(error.AuthFailed, c.rangeGet("bk", "o", 0, 3, &dst));
+
+    fs.expected_token = null;
+    fs.forced_status = 500;
+    var c2 = Client.init(gpa, fs.transport(), .{});
+    defer c2.deinit();
+    try testing.expectError(error.BadStatus, c2.rangeGet("bk", "o", 0, 3, &dst));
+}
+
+test "Client.rangeGet: rejects zero-length" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "b", "o", "x");
+    defer fs.deinit();
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+    var dst: [4]u8 = undefined;
+    try testing.expectError(error.EmptyRange, c.rangeGet("b", "o", 0, 0, &dst));
+}
