@@ -334,6 +334,75 @@ pub const FakeServer = struct {
 };
 
 // ---------------------------------------------------------------------------
+// RealTransport — production HttpTransport over std.http.Client.
+// ---------------------------------------------------------------------------
+
+/// Production `HttpTransport` backed by `std.http.Client`. Owns the
+/// underlying client across requests so connections can be reused. Caller
+/// supplies an `Io` instance (typically from `std.Io.Threaded.init`) at
+/// construction so transport selection composes with the rest of the
+/// program's I/O strategy.
+///
+/// Body bytes stream into a temporary `std.Io.Writer.Allocating` and are
+/// then memcpy'd into the caller's `body_dst`, capped at `body_dst.len`.
+/// `Response.body_len` reports the count actually written.
+///
+/// Lifetime: caller constructs once at startup and shares across
+/// `gcs.Client`s.
+pub const RealTransport = struct {
+    gpa: std.mem.Allocator,
+    inner: std.http.Client,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) RealTransport {
+        return .{
+            .gpa = gpa,
+            .inner = .{ .allocator = gpa, .io = io },
+        };
+    }
+
+    pub fn deinit(self: *RealTransport) void {
+        self.inner.deinit();
+        self.* = undefined;
+    }
+
+    pub fn transport(self: *RealTransport) HttpTransport {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    const vtable: HttpTransport.VTable = .{ .get = getImpl };
+
+    fn getImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+        body_dst: []u8,
+    ) anyerror!Response {
+        const self: *RealTransport = @ptrCast(@alignCast(ptr));
+
+        var stack_headers: [16]std.http.Header = undefined;
+        if (headers.len > stack_headers.len) return error.BodyTooLarge;
+        for (headers, 0..) |h, i| {
+            stack_headers[i] = .{ .name = h.name, .value = h.value };
+        }
+
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+
+        const result = try self.inner.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .extra_headers = stack_headers[0..headers.len],
+            .response_writer = &aw.writer,
+        });
+
+        const body = aw.written();
+        const n = @min(body_dst.len, body.len);
+        @memcpy(body_dst[0..n], body[0..n]);
+        return .{ .status = @intFromEnum(result.status), .body_len = n };
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -515,4 +584,131 @@ test "Client.rangeGet: rejects zero-length" {
     defer c.deinit();
     var dst: [4]u8 = undefined;
     try testing.expectError(error.EmptyRange, c.rangeGet("b", "o", 0, 0, &dst));
+}
+
+// ---------------------------------------------------------------------------
+// RealTransport tests — drive a localhost std.Io.net + std.http.Server.
+// ---------------------------------------------------------------------------
+
+const LoopbackArgs = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    response_status: std.http.Status,
+    response_body: []const u8,
+    seen_url_path: [256]u8 = undefined,
+    seen_url_path_len: usize = 0,
+    seen_range_value: [128]u8 = undefined,
+    seen_range_len: usize = 0,
+    seen_authorization: [256]u8 = undefined,
+    seen_authorization_len: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn loopbackServeOnce(args: *LoopbackArgs) void {
+    loopbackServeOnceInner(args) catch |e| {
+        args.err = e;
+    };
+}
+
+fn loopbackServeOnceInner(args: *LoopbackArgs) !void {
+    var stream = try args.server.accept(args.io);
+    defer stream.close(args.io);
+
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var sr = stream.reader(args.io, &read_buf);
+    var sw = stream.writer(args.io, &write_buf);
+    var http_server = std.http.Server.init(&sr.interface, &sw.interface);
+
+    var req = try http_server.receiveHead();
+
+    // Record observed URL path.
+    const path = req.head.target;
+    args.seen_url_path_len = @min(path.len, args.seen_url_path.len);
+    @memcpy(args.seen_url_path[0..args.seen_url_path_len], path[0..args.seen_url_path_len]);
+
+    // Record selected request headers.
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Range")) {
+            args.seen_range_len = @min(h.value.len, args.seen_range_value.len);
+            @memcpy(args.seen_range_value[0..args.seen_range_len], h.value[0..args.seen_range_len]);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "Authorization")) {
+            args.seen_authorization_len = @min(h.value.len, args.seen_authorization.len);
+            @memcpy(args.seen_authorization[0..args.seen_authorization_len], h.value[0..args.seen_authorization_len]);
+        }
+    }
+
+    try req.respond(args.response_body, .{ .status = args.response_status });
+}
+
+test "RealTransport: forwards URL + Range header to a localhost std.http.Server" {
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var args: LoopbackArgs = .{
+        .io = io,
+        .server = &server,
+        .response_status = .partial_content,
+        .response_body = "partial-bytes",
+    };
+    const server_thread = try std.Thread.spawn(.{}, loopbackServeOnce, .{&args});
+
+    var rt = RealTransport.init(gpa, io);
+    defer rt.deinit();
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bk/obj.sst", .{bound_port});
+
+    var dst: [32]u8 = undefined;
+    const headers = [_]Header{.{ .name = "Range", .value = "bytes=4-15" }};
+    const r = try rt.transport().get(url, &headers, &dst);
+    server_thread.join();
+
+    if (args.err) |e| return e;
+    try testing.expectEqual(@as(u16, 206), r.status);
+    try testing.expectEqualStrings("/bk/obj.sst", args.seen_url_path[0..args.seen_url_path_len]);
+    try testing.expectEqualStrings("bytes=4-15", args.seen_range_value[0..args.seen_range_len]);
+    try testing.expectEqualStrings("partial-bytes", dst[0..r.body_len]);
+}
+
+test "RealTransport: maps a 401 response to status=401" {
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var args: LoopbackArgs = .{
+        .io = io,
+        .server = &server,
+        .response_status = .unauthorized,
+        .response_body = "unauthorized\n",
+    };
+    const server_thread = try std.Thread.spawn(.{}, loopbackServeOnce, .{&args});
+
+    var rt = RealTransport.init(gpa, io);
+    defer rt.deinit();
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{bound_port});
+
+    var dst: [32]u8 = undefined;
+    const headers = [_]Header{};
+    const r = try rt.transport().get(url, &headers, &dst);
+    server_thread.join();
+
+    if (args.err) |e| return e;
+    try testing.expectEqual(@as(u16, 401), r.status);
 }
