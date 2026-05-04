@@ -12,6 +12,7 @@
 //! header when one is set; production token refresh lives in `auth.zig`.
 
 const std = @import("std");
+const auth = @import("auth.zig");
 
 pub const Error = error{
     EmptyRange,
@@ -59,10 +60,12 @@ pub const HttpTransport = struct {
 pub const Options = struct {
     /// Override for tests / staging. Must NOT have a trailing slash.
     base_url: []const u8 = DEFAULT_BASE_URL,
-    /// Optional bearer token. When set, every request carries
-    /// `Authorization: Bearer <token>`. Lifetime: borrowed; caller keeps
-    /// the token string alive.
+    /// Static bearer token. Used only when `token_source` is null. Carried
+    /// verbatim as `Authorization: Bearer <token>`. Lifetime: borrowed.
     bearer_token: ?[]const u8 = null,
+    /// Token source consulted before every request; supersedes
+    /// `bearer_token` when both are set. Lifetime: borrowed.
+    token_source: ?*auth.TokenSource = null,
 };
 
 pub const Client = struct {
@@ -106,7 +109,11 @@ pub const Client = struct {
         // sized for a typical OAuth2 access token.
         var auth_buf: [512]u8 = undefined;
         var auth_value: ?[]const u8 = null;
-        if (self.options.bearer_token) |t| {
+        if (self.options.token_source) |ts| {
+            const tok = ts.token() catch return error.AuthFailed;
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
+                return error.AuthFailed;
+        } else if (self.options.bearer_token) |t| {
             auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
                 return error.AuthFailed;
         }
@@ -273,9 +280,9 @@ pub const FakeServer = struct {
         self.last_url = try self.gpa.dupe(u8, url);
     }
 
-    fn recordAuth(self: *FakeServer, auth: ?[]const u8) !void {
+    fn recordAuth(self: *FakeServer, auth_value: ?[]const u8) !void {
         if (self.last_auth_seen) |a| self.gpa.free(a);
-        self.last_auth_seen = if (auth) |x| try self.gpa.dupe(u8, x) else null;
+        self.last_auth_seen = if (auth_value) |x| try self.gpa.dupe(u8, x) else null;
     }
 
     fn getImpl(
@@ -711,4 +718,61 @@ test "RealTransport: maps a 401 response to status=401" {
 
     if (args.err) |e| return e;
     try testing.expectEqual(@as(u16, 401), r.status);
+}
+
+// ---------------------------------------------------------------------------
+// TokenSource wiring tests — Client.rangeGet must consult token_source first.
+// ---------------------------------------------------------------------------
+
+test "Client.rangeGet: pulls bearer from TokenSource and rotates across calls" {
+    const gpa = testing.allocator;
+
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "obj.sst", "abcdefgh");
+    defer fs.deinit();
+
+    const RotatingMeta = struct {
+        n: u32 = 0,
+
+        pub fn transport(self: *@This()) HttpTransport {
+            return .{ .ptr = @ptrCast(self), .vtable = &vt };
+        }
+        const vt: HttpTransport.VTable = .{ .get = getImpl };
+        fn getImpl(p: *anyopaque, _: []const u8, _: []const Header, body_dst: []u8) anyerror!Response {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.n += 1;
+            // First call: short expiry forces refresh on the second rangeGet.
+            // Second call: long expiry; would not refresh again on a third.
+            const json = if (self.n == 1)
+                "{\"access_token\":\"tok-A\",\"expires_in\":1}"
+            else
+                "{\"access_token\":\"tok-B\",\"expires_in\":3600}";
+            const n = @min(body_dst.len, json.len);
+            @memcpy(body_dst[0..n], json[0..n]);
+            return .{ .status = 200, .body_len = n };
+        }
+    };
+    var meta = RotatingMeta{};
+
+    var ts = auth.TokenSource.init(
+        gpa,
+        meta.transport(),
+        auth.DEFAULT_METADATA_URL,
+        auth.SystemClock.clock(),
+    );
+    defer ts.deinit();
+
+    var c = Client.init(gpa, fs.transport(), .{ .token_source = &ts });
+    defer c.deinit();
+
+    var dst: [3]u8 = undefined;
+
+    fs.expected_token = "tok-A";
+    _ = try c.rangeGet("bk", "obj.sst", 0, 3, &dst);
+    try testing.expectEqualStrings("Bearer tok-A", fs.last_auth_seen.?);
+
+    fs.expected_token = "tok-B";
+    _ = try c.rangeGet("bk", "obj.sst", 0, 3, &dst);
+    try testing.expectEqualStrings("Bearer tok-B", fs.last_auth_seen.?);
+
+    try testing.expectEqual(@as(u32, 2), meta.n);
 }
