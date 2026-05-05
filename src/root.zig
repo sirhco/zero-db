@@ -20,6 +20,7 @@ pub const sstable_manifest = @import("sstable/manifest.zig");
 pub const engine = @import("engine/engine.zig");
 pub const memtable = @import("engine/memtable.zig");
 pub const compaction = @import("engine/compaction.zig");
+pub const wal = @import("engine/wal.zig");
 
 pub const bloom = @import("bloom/filter.zig");
 
@@ -75,6 +76,7 @@ test {
     _ = @import("engine/engine.zig");
     _ = @import("engine/memtable.zig");
     _ = @import("engine/compaction.zig");
+    _ = @import("engine/wal.zig");
     _ = @import("bloom/filter.zig");
     _ = @import("cache/lru.zig");
     _ = @import("cache/block_cache.zig");

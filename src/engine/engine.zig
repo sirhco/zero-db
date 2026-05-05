@@ -29,6 +29,7 @@ const manifest_mod = @import("../sstable/manifest.zig");
 const block_cache_mod = @import("../cache/block_cache.zig");
 const tracking_mod = @import("../alloc/tracking.zig");
 const compactor_mod = @import("compaction.zig");
+const wal_mod = @import("wal.zig");
 
 /// Thin spin-yield mutex. Zig 0.16's `std.Io.Mutex` requires threading
 /// an `Io` value through every lock/unlock site; we want a leaf-level
@@ -102,6 +103,13 @@ pub const Options = struct {
     /// merge when the compactor is started. 0 disables the auto-trigger
     /// entirely (only `compactAll()` can run a merge). Default 4.
     l0_compaction_threshold: usize = 4,
+
+    /// Optional path to a write-ahead log. When set, every successful
+    /// `set` / `delete` is appended (and fsync'd) before the entry
+    /// lands in the active MemTable. On `init`, replays existing
+    /// records into the active MemTable so an in-process crash does
+    /// not lose committed writes.
+    wal_path: ?[]const u8 = null,
 };
 
 pub const Engine = struct {
@@ -151,6 +159,10 @@ pub const Engine = struct {
     /// MemTable stays in `frozen_tables` for a future flush retry).
     compaction_failure_count: u32 = 0,
 
+    /// Open WAL file when persistence-via-WAL is enabled. Closed in
+    /// `deinit`.
+    wal: ?wal_mod.Wal = null,
+
     pub fn init(gpa: std.mem.Allocator, options: Options) !Engine {
         var e: Engine = .{
             .gpa = gpa,
@@ -172,7 +184,29 @@ pub const Engine = struct {
         if (options.gcs_client != null) {
             try e.loadFromManifest();
         }
+
+        if (options.wal_path) |p| {
+            e.wal = wal_mod.Wal.open(gpa, p) catch return error.OutOfMemory;
+            try e.replayWal();
+        }
         return e;
+    }
+
+    fn replayWal(self: *Engine) Error!void {
+        const Visitor = struct {
+            engine: *Engine,
+            pub const Op = enum { set, delete };
+            pub fn apply(v: *@This(), op: Op, key: []const u8, value: []const u8) anyerror!void {
+                switch (op) {
+                    .set => try v.engine.active.put(key, value),
+                    .delete => try v.engine.active.putTombstone(key),
+                }
+            }
+        };
+        var v = Visitor{ .engine = self };
+        if (self.wal) |*w| {
+            w.replay(&v) catch return error.OutOfMemory;
+        }
     }
 
     pub fn deinit(self: *Engine) void {
@@ -197,6 +231,7 @@ pub const Engine = struct {
             bc.deinit();
             self.gpa.destroy(bc);
         }
+        if (self.wal) |*w| w.close();
 
         self.active.deinit();
         self.* = undefined;
@@ -315,6 +350,9 @@ pub const Engine = struct {
         if (self.options.tracking_allocator) |ta| {
             if (ta.isOverBudget()) return error.OverMemoryBudget;
         }
+        if (self.wal) |*w| {
+            w.appendSet(key, value) catch return error.OutOfMemory;
+        }
         try self.active.put(key, value);
         try self.maybeFlush();
     }
@@ -322,6 +360,9 @@ pub const Engine = struct {
     pub fn delete(self: *Engine, key: []const u8) Error!void {
         if (self.options.tracking_allocator) |ta| {
             if (ta.isOverBudget()) return error.OverMemoryBudget;
+        }
+        if (self.wal) |*w| {
+            w.appendDelete(key) catch return error.OutOfMemory;
         }
         try self.active.putTombstone(key);
         try self.maybeFlush();
@@ -1140,6 +1181,42 @@ test "Engine: startCompactor — async flush still surfaces keys + correct sstab
         defer gpa.free(got);
         try testing.expectEqualStrings(c.want, got);
     }
+}
+
+test "Engine: WAL replay restores writes lost to in-process crash" {
+    const gpa = testing.allocator;
+    const pid = std.posix.system.getpid();
+    var path_buf: [128]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&path_buf, "/tmp/zero-db-engine-wal-{d}.log", .{pid});
+    defer {
+        if (gpa.dupeZ(u8, wal_path)) |path_z| {
+            _ = std.posix.system.unlink(path_z.ptr);
+            gpa.free(path_z);
+        } else |_| {}
+    }
+
+    {
+        var e = try Engine.init(gpa, .{ .block_cache_bytes = 0, .wal_path = wal_path });
+        defer e.deinit();
+        try e.set("alpha", "AAA");
+        try e.set("bravo", "BB");
+        try e.delete("alpha");
+        try e.set("charlie", "CCC");
+        // Critically: NO flush. The data lives only in the WAL.
+    }
+
+    var e2 = try Engine.init(gpa, .{ .block_cache_bytes = 0, .wal_path = wal_path });
+    defer e2.deinit();
+
+    try testing.expectEqual(@as(?[]u8, null), try e2.get("alpha", gpa));
+
+    const b = (try e2.get("bravo", gpa)).?;
+    defer gpa.free(b);
+    try testing.expectEqualStrings("BB", b);
+
+    const c = (try e2.get("charlie", gpa)).?;
+    defer gpa.free(c);
+    try testing.expectEqualStrings("CCC", c);
 }
 
 test "Engine: L0 threshold triggers auto-merge through Compactor" {
