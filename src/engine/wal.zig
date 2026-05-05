@@ -62,6 +62,29 @@ pub const Wal = struct {
         return lseekEnd(self.fd);
     }
 
+    /// Drop everything before `start_offset` from the file. Implemented
+    /// as "truncate to zero, lose absorbed prefix forever". This is
+    /// safe only when `start_offset` covers every record currently
+    /// committed to durable SSTables — the engine guarantees this via
+    /// `manifest.wal_committed_bytes`.
+    ///
+    /// Concretely: if start_offset >= current file size, the file is
+    /// truncated to 0 (every record is durable). Otherwise no-op (we
+    /// don't yet support partial-prefix trim — would require copying
+    /// the surviving suffix into a new file). Phase 20+ if that
+    /// becomes a hot path.
+    pub fn truncateAbsorbed(self: *Wal, start_offset: u64) !void {
+        const sz = try self.size();
+        if (sz == 0) return;
+        if (start_offset < sz) return; // partial trim unsupported
+
+        switch (std.posix.errno(std.posix.system.ftruncate(self.fd, 0))) {
+            .SUCCESS => {},
+            else => return error.WriteFailed,
+        }
+        _ = lseekSet(self.fd, 0) catch return error.WriteFailed;
+    }
+
     pub fn appendSet(self: *Wal, key: []const u8, value: []const u8) Error!void {
         try self.appendRecord(TAG_SET, key, value);
     }

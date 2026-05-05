@@ -22,6 +22,7 @@ const fmt = @import("format.zig");
 const footer_mod = @import("footer.zig");
 const index_mod = @import("index.zig");
 const block_cache_mod = @import("../cache/block_cache.zig");
+const prefetch_mod = @import("../prefetch/adaptive.zig");
 
 pub const Storage = blob.Storage;
 
@@ -72,6 +73,13 @@ pub const Reader = struct {
     /// the bytes are populated into the cache for the next call.
     block_cache: ?*block_cache_mod.BlockCache = null,
 
+    /// Optional adaptive-prefetch tracker. When set, every successful
+    /// data-block fetch records `(key, block_range)` so co-occurring
+    /// keys can be predicted on a future request. Reader does not yet
+    /// consume the returned prediction — wiring lands when production
+    /// traffic exposes the hot key shapes.
+    tracker: ?*prefetch_mod.Tracker = null,
+
     /// Cached metadata. Loaded on demand; reused across all `get` calls.
     /// When `block_cache` is set, these stay null — the cache is the
     /// single source of truth.
@@ -90,6 +98,10 @@ pub const Reader = struct {
         cache: *block_cache_mod.BlockCache,
     ) Reader {
         return .{ .gpa = gpa, .storage = storage, .sstable_id = sstable_id, .block_cache = cache };
+    }
+
+    pub fn attachTracker(self: *Reader, tracker: *prefetch_mod.Tracker) void {
+        self.tracker = tracker;
     }
 
     pub fn deinit(self: *Reader) void {
@@ -114,6 +126,14 @@ pub const Reader = struct {
         const idx_bytes = try self.loadIndex(f);
         const idx = try index_mod.IndexBlock.parse(idx_bytes);
         const loc = (try idx.find(key)) orelse return null;
+
+        if (self.tracker) |t| {
+            // Best-effort: tracker errors are advisory, never propagate.
+            _ = t.observe(.{
+                .key = key,
+                .range = .{ .offset = loc.block_offset, .len = loc.block_size },
+            }) catch {};
+        }
 
         // Resolve the data block bytes, preferring the shared BlockCache
         // when configured. On a cache miss we still own a temporary local
@@ -744,6 +764,37 @@ test "Reader: BlockCache cuts cross-Reader rangeGets to footer-only" {
     try testing.expectEqualStrings("AAA", a2.present);
 
     try testing.expectEqual(baseline_after_first_get + 1, fs.call_count);
+}
+
+test "Reader: attachTracker records key->block-range observations" {
+    const gpa = testing.allocator;
+    var b = try writer.Builder.init(gpa, .{ .expected_entries = 4 });
+    defer b.deinit();
+    try b.add("alpha", "AAA");
+    try b.add("bravo", "BBBB");
+    const sst = try b.finish();
+    defer gpa.free(sst);
+
+    var ms = blob.MemoryStorage.init(sst);
+    var r = Reader.init(gpa, ms.storage());
+    defer r.deinit();
+
+    var t = prefetch_mod.Tracker.init(gpa);
+    defer t.deinit();
+    r.attachTracker(&t);
+
+    const a = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a.present);
+    const c = (try r.get("bravo", gpa)).?;
+    defer gpa.free(c.present);
+
+    // After "alpha" -> "bravo", the tracker holds at least one
+    // transition. Probing "alpha" again returns bravo's block range.
+    const pred = (try t.observe(.{
+        .key = "alpha",
+        .range = .{ .offset = 0, .len = 1 },
+    })).?;
+    try testing.expect(pred.len > 0);
 }
 
 test "Reader: BlockCache hit on second get within same Reader skips data fetch" {

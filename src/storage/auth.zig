@@ -79,6 +79,18 @@ pub const TokenSource = struct {
         self.* = undefined;
     }
 
+    /// Drop the cached token. The next `token()` call will refresh from
+    /// the metadata service. Used by `gcs.Client` to recover from a 401
+    /// — the metadata service may have rotated the token before its
+    /// nominal expiry.
+    pub fn invalidate(self: *TokenSource) void {
+        if (self.cached_token) |t| {
+            self.gpa.free(t);
+            self.cached_token = null;
+        }
+        self.expires_at_unix_seconds = 0;
+    }
+
     /// Returns the current access token, fetching from the metadata service
     /// if no token is cached or the cached one is within
     /// REFRESH_LEAD_SECONDS of expiry. Caller does NOT free; lifetime is

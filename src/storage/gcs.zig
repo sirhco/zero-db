@@ -125,49 +125,54 @@ pub const Client = struct {
         if (len == 0) return error.EmptyRange;
         std.debug.assert(len <= dst.len);
 
-        // URL — we own the buffer for the duration of the call.
         var url_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer url_arena.deinit();
         const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
             return error.InvalidObject;
 
-        // Range header. Stack-allocated; lives through transport.get.
         var range_buf: [64]u8 = undefined;
         const range_value = formatRangeHeader(&range_buf, start, len) catch return error.EmptyRange;
 
-        // Optional Authorization. Allocate a small buffer on the stack
-        // sized for a typical OAuth2 access token.
-        var auth_buf: [512]u8 = undefined;
-        var auth_value: ?[]const u8 = null;
-        if (self.options.token_source) |ts| {
-            const tok = ts.token() catch return error.AuthFailed;
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
-                return error.AuthFailed;
-        } else if (self.options.bearer_token) |t| {
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
-                return error.AuthFailed;
-        }
+        // Single attempt; on 401 with a TokenSource configured we retry
+        // once after invalidating the cached token. The metadata service
+        // may have rotated us early.
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var auth_buf: [512]u8 = undefined;
+            const auth_value = try self.resolveAuthHeader(&auth_buf);
 
-        var headers: [2]Header = undefined;
-        var n: usize = 1;
-        headers[0] = .{ .name = "Range", .value = range_value };
-        if (auth_value) |av| {
-            headers[1] = .{ .name = "Authorization", .value = av };
-            n = 2;
-        }
+            var headers: [2]Header = undefined;
+            var n: usize = 1;
+            headers[0] = .{ .name = "Range", .value = range_value };
+            if (auth_value) |av| {
+                headers[1] = .{ .name = "Authorization", .value = av };
+                n = 2;
+            }
 
-        const resp = self.transport.get(url, headers[0..n], dst[0..len]) catch
-            return error.HttpError;
+            const resp = self.transport.get(url, headers[0..n], dst[0..len]) catch
+                return error.HttpError;
 
-        // GCS returns 200 (full object, when our range covers it all) or
-        // 206 (partial content) on success. Anything else is a failure.
-        if (resp.status != 200 and resp.status != 206) {
+            if (resp.status == 200 or resp.status == 206) return resp.body_len;
+            if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
+                self.options.token_source.?.invalidate();
+                continue;
+            }
             return switch (resp.status) {
                 401, 403 => error.AuthFailed,
                 else => error.BadStatus,
             };
         }
-        return resp.body_len;
+    }
+
+    fn resolveAuthHeader(self: *Client, auth_buf: []u8) Error!?[]const u8 {
+        if (self.options.token_source) |ts| {
+            const tok = ts.token() catch return error.AuthFailed;
+            return std.fmt.bufPrint(auth_buf, "Bearer {s}", .{tok}) catch error.AuthFailed;
+        }
+        if (self.options.bearer_token) |t| {
+            return std.fmt.bufPrint(auth_buf, "Bearer {s}", .{t}) catch error.AuthFailed;
+        }
+        return null;
     }
 
     /// `PUT <base>/<bucket>/<object>` with `body` as the object payload.
@@ -185,34 +190,32 @@ pub const Client = struct {
         const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
             return error.InvalidObject;
 
-        var auth_buf: [512]u8 = undefined;
-        var auth_value: ?[]const u8 = null;
-        if (self.options.token_source) |ts| {
-            const tok = ts.token() catch return error.AuthFailed;
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
-                return error.AuthFailed;
-        } else if (self.options.bearer_token) |t| {
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
-                return error.AuthFailed;
-        }
-
         var len_buf: [32]u8 = undefined;
         const len_value = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch
             return error.OutOfMemory;
 
-        var headers: [3]Header = undefined;
-        var n: usize = 2;
-        headers[0] = .{ .name = "Content-Type", .value = "application/octet-stream" };
-        headers[1] = .{ .name = "Content-Length", .value = len_value };
-        if (auth_value) |av| {
-            headers[2] = .{ .name = "Authorization", .value = av };
-            n = 3;
-        }
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var auth_buf: [512]u8 = undefined;
+            const auth_value = try self.resolveAuthHeader(&auth_buf);
 
-        const resp = self.transport.put(url, headers[0..n], body) catch
-            return error.HttpError;
+            var headers: [3]Header = undefined;
+            var n: usize = 2;
+            headers[0] = .{ .name = "Content-Type", .value = "application/octet-stream" };
+            headers[1] = .{ .name = "Content-Length", .value = len_value };
+            if (auth_value) |av| {
+                headers[2] = .{ .name = "Authorization", .value = av };
+                n = 3;
+            }
 
-        if (resp.status != 200 and resp.status != 201) {
+            const resp = self.transport.put(url, headers[0..n], body) catch
+                return error.HttpError;
+
+            if (resp.status == 200 or resp.status == 201) return;
+            if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
+                self.options.token_source.?.invalidate();
+                continue;
+            }
             return switch (resp.status) {
                 401, 403 => error.AuthFailed,
                 else => error.PutFailed,
@@ -234,28 +237,26 @@ pub const Client = struct {
         const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
             return error.InvalidObject;
 
-        var auth_buf: [512]u8 = undefined;
-        var auth_value: ?[]const u8 = null;
-        if (self.options.token_source) |ts| {
-            const tok = ts.token() catch return error.AuthFailed;
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
-                return error.AuthFailed;
-        } else if (self.options.bearer_token) |t| {
-            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
-                return error.AuthFailed;
-        }
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var auth_buf: [512]u8 = undefined;
+            const auth_value = try self.resolveAuthHeader(&auth_buf);
 
-        var headers: [1]Header = undefined;
-        var n: usize = 0;
-        if (auth_value) |av| {
-            headers[0] = .{ .name = "Authorization", .value = av };
-            n = 1;
-        }
+            var headers: [1]Header = undefined;
+            var n: usize = 0;
+            if (auth_value) |av| {
+                headers[0] = .{ .name = "Authorization", .value = av };
+                n = 1;
+            }
 
-        const resp = self.transport.delete(url, headers[0..n]) catch
-            return error.HttpError;
+            const resp = self.transport.delete(url, headers[0..n]) catch
+                return error.HttpError;
 
-        if (resp.status != 200 and resp.status != 204 and resp.status != 404) {
+            if (resp.status == 200 or resp.status == 204 or resp.status == 404) return;
+            if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
+                self.options.token_source.?.invalidate();
+                continue;
+            }
             return switch (resp.status) {
                 401, 403 => error.AuthFailed,
                 else => error.DeleteFailed,
@@ -1139,6 +1140,56 @@ test "Client.deleteObject: 404 on missing object is folded into success" {
 
     try c.deleteObject("bk", "never/existed.sst");
     try testing.expectEqual(@as(u32, 1), fs.delete_count);
+}
+
+test "Client.rangeGet: 401 + TokenSource triggers a single refresh-and-retry" {
+    const gpa = testing.allocator;
+
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "obj.sst", "abcdefgh");
+    defer fs.deinit();
+    fs.expected_token = "tok-good";
+
+    // Metadata server: first call returns "tok-bad", second "tok-good".
+    const RotatingMeta = struct {
+        n: u32 = 0,
+        pub fn transport(self: *@This()) HttpTransport {
+            return .{ .ptr = @ptrCast(self), .vtable = &vt };
+        }
+        const vt: HttpTransport.VTable = .{
+            .get = getImpl,
+            .put = HttpTransport.unsupportedPut,
+            .delete = HttpTransport.unsupportedDelete,
+        };
+        fn getImpl(p: *anyopaque, _: []const u8, _: []const Header, body_dst: []u8) anyerror!Response {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.n += 1;
+            const json = if (self.n == 1)
+                "{\"access_token\":\"tok-bad\",\"expires_in\":3600}"
+            else
+                "{\"access_token\":\"tok-good\",\"expires_in\":3600}";
+            const k = @min(body_dst.len, json.len);
+            @memcpy(body_dst[0..k], json[0..k]);
+            return .{ .status = 200, .body_len = k };
+        }
+    };
+    var meta = RotatingMeta{};
+
+    var ts = auth.TokenSource.init(
+        gpa,
+        meta.transport(),
+        auth.DEFAULT_METADATA_URL,
+        auth.SystemClock.clock(),
+    );
+    defer ts.deinit();
+
+    var c = Client.init(gpa, fs.transport(), .{ .token_source = &ts });
+    defer c.deinit();
+
+    var dst: [3]u8 = undefined;
+    const n = try c.rangeGet("bk", "obj.sst", 0, 3, &dst);
+    try testing.expectEqual(@as(usize, 3), n);
+    // Two metadata calls total: the initial token + the post-401 refresh.
+    try testing.expectEqual(@as(u32, 2), meta.n);
 }
 
 test "Client.deleteObject: forced 500 maps to DeleteFailed" {

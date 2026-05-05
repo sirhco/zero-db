@@ -314,6 +314,8 @@ pub const Engine = struct {
             mt.deinit();
             self.gpa.destroy(mt);
 
+            self.maybeTruncateWal();
+
             const threshold = self.options.l0_compaction_threshold;
             break :blk threshold > 0 and self.sstables.items.len >= threshold;
         };
@@ -489,6 +491,50 @@ pub const Engine = struct {
             self.gpa.destroy(ft);
         }
         self.frozen_tables.clearRetainingCapacity();
+        self.maybeTruncateWal();
+    }
+
+    /// Best-effort WAL truncation: if every record currently in the file
+    /// is covered by `manifest.wal_committed_bytes`, persist a manifest
+    /// with the checkpoint reset to 0 then drop the file to 0. Resetting
+    /// the manifest first keeps cold-restart replay correct: post-
+    /// truncation writes start at offset 0, the new manifest skips no
+    /// prefix.
+    ///
+    /// In-memory mode (no manifest) skips the persistence step but still
+    /// truncates so the file does not grow unbounded across long-running
+    /// tests.
+    fn maybeTruncateWal(self: *Engine) void {
+        const w = if (self.wal) |*w| w else return;
+        const sz = w.size() catch return;
+        if (sz == 0) return;
+
+        if (self.manifest) |*m| {
+            if (m.wal_committed_bytes == 0 or m.wal_committed_bytes < sz) return;
+
+            // Reset the manifest's checkpoint to 0 BEFORE truncating, so
+            // a crash mid-truncate does not leave on-disk state with a
+            // checkpoint that points past the new (smaller) file. Upload
+            // the reset manifest first; only on upload-success do we
+            // actually shrink the file.
+            const old_checkpoint = m.wal_committed_bytes;
+            m.wal_committed_bytes = 0;
+            if (self.options.gcs_client) |client| {
+                const bytes = m.serialize() catch {
+                    m.wal_committed_bytes = old_checkpoint;
+                    return;
+                };
+                defer self.gpa.free(bytes);
+                client.putObject(self.options.bucket, self.options.manifest_object, bytes) catch {
+                    m.wal_committed_bytes = old_checkpoint;
+                    return;
+                };
+            }
+            w.truncateAbsorbed(old_checkpoint) catch {};
+        } else {
+            // In-memory mode: no manifest to keep in sync, just truncate.
+            w.truncateAbsorbed(sz) catch {};
+        }
     }
 
     /// Upload `sst_bytes` to GCS, append a manifest entry, rewrite the
@@ -1330,11 +1376,11 @@ test "Engine: WAL checkpoint advances past flushed records (no double-replay)" {
     });
     defer e2.deinit();
 
-    // alpha + bravo come from the SSTable; charlie comes from the WAL replay.
-    try testing.expect(e2.manifest.?.wal_committed_bytes > 0);
-
-    // Post-restart, only "charlie" should live in the active MemTable.
-    // (alpha/bravo are in an SSTable, not active.)
+    // alpha + bravo come from the SSTable; charlie comes from the WAL
+    // replay. Post-restart, only "charlie" should live in the active
+    // MemTable. The truncation hook (Post-20A) resets wal_committed_bytes
+    // to 0 after truncation since records past that point are gone, so we
+    // assert behavior, not the raw checkpoint value.
     try testing.expectEqual(@as(u32, 1), e2.entryCountActive());
 
     const a = (try e2.get("alpha", gpa)).?;
@@ -1346,6 +1392,45 @@ test "Engine: WAL checkpoint advances past flushed records (no double-replay)" {
     const c = (try e2.get("charlie", gpa)).?;
     defer gpa.free(c);
     try testing.expectEqualStrings("CCC", c);
+}
+
+test "Engine: WAL file truncates to 0 once every record is checkpointed" {
+    const gpa = testing.allocator;
+    const pid = std.posix.system.getpid();
+    var path_buf: [128]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&path_buf, "/tmp/zero-db-wal-trunc-{d}.log", .{pid});
+    defer {
+        if (gpa.dupeZ(u8, wal_path)) |path_z| {
+            _ = std.posix.system.unlink(path_z.ptr);
+            gpa.free(path_z);
+        } else |_| {}
+    }
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "unused", "");
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var e = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 0,
+        .wal_path = wal_path,
+    });
+    defer e.deinit();
+
+    try e.set("alpha", "AAA");
+    try e.set("bravo", "BB");
+    try testing.expect((try e.wal.?.size()) > 0);
+    try e.flush();
+    // After flush, every record is in the SSTable + manifest; truncation
+    // hook should have dropped the file to 0.
+    try testing.expectEqual(@as(u64, 0), try e.wal.?.size());
+
+    // New writes after truncation continue to land at offset 0+.
+    try e.set("charlie", "CCC");
+    try testing.expect((try e.wal.?.size()) > 0);
 }
 
 test "Engine: WAL replay restores writes lost to in-process crash" {
