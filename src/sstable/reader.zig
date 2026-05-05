@@ -21,6 +21,7 @@ const data_block = @import("data_block.zig");
 const fmt = @import("format.zig");
 const footer_mod = @import("footer.zig");
 const index_mod = @import("index.zig");
+const block_cache_mod = @import("../cache/block_cache.zig");
 
 pub const Storage = blob.Storage;
 
@@ -61,13 +62,34 @@ pub const Reader = struct {
     gpa: std.mem.Allocator,
     storage: Storage,
 
+    /// Identifies this SSTable for the optional shared `BlockCache`.
+    /// Defaulted to 0 for legacy callers that do not wire a cache; in
+    /// that mode the field is ignored.
+    sstable_id: u64 = 0,
+
+    /// Optional shared cross-Reader cache. When set, every loadIndex /
+    /// loadBloom / data-block fetch consults the cache first; on miss
+    /// the bytes are populated into the cache for the next call.
+    block_cache: ?*block_cache_mod.BlockCache = null,
+
     /// Cached metadata. Loaded on demand; reused across all `get` calls.
+    /// When `block_cache` is set, these stay null — the cache is the
+    /// single source of truth.
     footer_cached: ?footer_mod.Footer = null,
     bloom_buf: ?[]u8 = null,
     index_buf: ?[]u8 = null,
 
     pub fn init(gpa: std.mem.Allocator, storage: Storage) Reader {
         return .{ .gpa = gpa, .storage = storage };
+    }
+
+    pub fn initWithCache(
+        gpa: std.mem.Allocator,
+        storage: Storage,
+        sstable_id: u64,
+        cache: *block_cache_mod.BlockCache,
+    ) Reader {
+        return .{ .gpa = gpa, .storage = storage, .sstable_id = sstable_id, .block_cache = cache };
     }
 
     pub fn deinit(self: *Reader) void {
@@ -93,14 +115,41 @@ pub const Reader = struct {
         const idx = try index_mod.IndexBlock.parse(idx_bytes);
         const loc = (try idx.find(key)) orelse return null;
 
-        // Fetch the resolved data block. Block payload buffers are not
-        // cached at this layer — the upstream block cache (later) decides
-        // what to keep.
+        // Resolve the data block bytes, preferring the shared BlockCache
+        // when configured. On a cache miss we still own a temporary local
+        // buffer for the lifetime of the scan; on a cache hit the slice
+        // is borrowed and must NOT be freed.
+        if (self.block_cache) |bc| {
+            const k: block_cache_mod.Key = .{
+                .sstable_id = self.sstable_id,
+                .kind = .data,
+                .offset = loc.block_offset,
+            };
+            if (bc.get(k)) |cached| {
+                const payload = try verifyDataBlock(cached);
+                return scanDataBlock(payload, key, out_gpa);
+            }
+        }
+
         const block_buf = try self.gpa.alloc(u8, loc.block_size);
         defer self.gpa.free(block_buf);
         const got = self.storage.rangeGet(block_buf, loc.block_offset, loc.block_size) catch
             return error.BadDataBlock;
         if (got != loc.block_size) return error.ShortRead;
+
+        if (self.block_cache) |bc| {
+            const k: block_cache_mod.Key = .{
+                .sstable_id = self.sstable_id,
+                .kind = .data,
+                .offset = loc.block_offset,
+            };
+            // Best-effort cache fill. OverCapacity (single block exceeds
+            // configured ceiling) silently bypasses; OOM propagates.
+            bc.put(k, block_buf) catch |err| switch (err) {
+                error.OverCapacity => {},
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+        }
 
         const payload = try verifyDataBlock(block_buf);
         return scanDataBlock(payload, key, out_gpa);
@@ -123,6 +172,26 @@ pub const Reader = struct {
     }
 
     fn loadBloom(self: *Reader, f: footer_mod.Footer) ReaderError![]const u8 {
+        if (self.block_cache) |bc| {
+            const k: block_cache_mod.Key = .{
+                .sstable_id = self.sstable_id,
+                .kind = .bloom,
+                .offset = f.bloom_offset,
+            };
+            if (bc.get(k)) |cached| return cached;
+
+            const buf = try self.gpa.alloc(u8, f.bloom_size);
+            defer self.gpa.free(buf);
+            const got = self.storage.rangeGet(buf, f.bloom_offset, f.bloom_size) catch
+                return error.BadBloom;
+            if (got != f.bloom_size) return error.ShortRead;
+
+            bc.put(k, buf) catch |err| switch (err) {
+                error.OverCapacity => return self.fallbackPerReaderBloom(buf),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            return bc.get(k) orelse return error.OutOfMemory;
+        }
         if (self.bloom_buf) |b| return b;
         const buf = try self.gpa.alloc(u8, f.bloom_size);
         errdefer self.gpa.free(buf);
@@ -133,7 +202,36 @@ pub const Reader = struct {
         return buf;
     }
 
+    fn fallbackPerReaderBloom(self: *Reader, src: []const u8) ReaderError![]const u8 {
+        // Block too big for the shared cache. Fall back to per-Reader
+        // ownership — same path the no-cache mode uses.
+        if (self.bloom_buf) |b| return b;
+        const owned = try self.gpa.dupe(u8, src);
+        self.bloom_buf = owned;
+        return owned;
+    }
+
     fn loadIndex(self: *Reader, f: footer_mod.Footer) ReaderError![]const u8 {
+        if (self.block_cache) |bc| {
+            const k: block_cache_mod.Key = .{
+                .sstable_id = self.sstable_id,
+                .kind = .index,
+                .offset = f.index_offset,
+            };
+            if (bc.get(k)) |cached| return cached;
+
+            const buf = try self.gpa.alloc(u8, f.index_size);
+            defer self.gpa.free(buf);
+            const got = self.storage.rangeGet(buf, f.index_offset, f.index_size) catch
+                return error.BadIndex;
+            if (got != f.index_size) return error.ShortRead;
+
+            bc.put(k, buf) catch |err| switch (err) {
+                error.OverCapacity => return self.fallbackPerReaderIndex(buf),
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            return bc.get(k) orelse return error.OutOfMemory;
+        }
         if (self.index_buf) |b| return b;
         const buf = try self.gpa.alloc(u8, f.index_size);
         errdefer self.gpa.free(buf);
@@ -142,6 +240,13 @@ pub const Reader = struct {
         if (got != f.index_size) return error.ShortRead;
         self.index_buf = buf;
         return buf;
+    }
+
+    fn fallbackPerReaderIndex(self: *Reader, src: []const u8) ReaderError![]const u8 {
+        if (self.index_buf) |b| return b;
+        const owned = try self.gpa.dupe(u8, src);
+        self.index_buf = owned;
+        return owned;
     }
 };
 
@@ -594,4 +699,84 @@ test "verifyDataBlock rejects buffers shorter than the trailer" {
     try testing.expectError(error.BadDataBlock, verifyDataBlock(&tiny));
     var empty: [0]u8 = .{};
     try testing.expectError(error.BadDataBlock, verifyDataBlock(&empty));
+}
+
+test "Reader: BlockCache cuts cross-Reader rangeGets to footer-only" {
+    const gpa = testing.allocator;
+    const gcs = @import("../storage/gcs.zig");
+    const gcs_storage_mod = @import("../storage/gcs_storage.zig");
+
+    var b = try writer.Builder.init(gpa, .{ .expected_entries = 4 });
+    defer b.deinit();
+    try b.add("alpha", "AAA");
+    try b.add("bravo", "BBBB");
+    try b.add("charlie", "CCCCC");
+    const sst = try b.finish();
+    defer gpa.free(sst);
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "obj.sst", sst);
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var bc = block_cache_mod.BlockCache.init(gpa, 64 * 1024);
+    defer bc.deinit();
+
+    var storage1 = gcs_storage_mod.GcsStorage.init(&client, "bk", "obj.sst", sst.len);
+    var r1 = Reader.initWithCache(gpa, storage1.storage(), 42, &bc);
+    defer r1.deinit();
+
+    const a1 = (try r1.get("alpha", gpa)).?;
+    defer gpa.free(a1.present);
+    try testing.expectEqualStrings("AAA", a1.present);
+
+    const baseline_after_first_get = fs.call_count;
+
+    // Second Reader against the same SSTable. footer is per-Reader so it
+    // is fetched again; index/bloom/data come from the shared BlockCache
+    // → exactly 1 additional rangeGet (the footer tail-read).
+    var storage2 = gcs_storage_mod.GcsStorage.init(&client, "bk", "obj.sst", sst.len);
+    var r2 = Reader.initWithCache(gpa, storage2.storage(), 42, &bc);
+    defer r2.deinit();
+
+    const a2 = (try r2.get("alpha", gpa)).?;
+    defer gpa.free(a2.present);
+    try testing.expectEqualStrings("AAA", a2.present);
+
+    try testing.expectEqual(baseline_after_first_get + 1, fs.call_count);
+}
+
+test "Reader: BlockCache hit on second get within same Reader skips data fetch" {
+    const gpa = testing.allocator;
+    const gcs = @import("../storage/gcs.zig");
+    const gcs_storage_mod = @import("../storage/gcs_storage.zig");
+
+    var b = try writer.Builder.init(gpa, .{ .expected_entries = 4 });
+    defer b.deinit();
+    try b.add("alpha", "AAA");
+    try b.add("bravo", "BBBB");
+    const sst = try b.finish();
+    defer gpa.free(sst);
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "o", sst);
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var bc = block_cache_mod.BlockCache.init(gpa, 64 * 1024);
+    defer bc.deinit();
+
+    var storage = gcs_storage_mod.GcsStorage.init(&client, "bk", "o", sst.len);
+    var r = Reader.initWithCache(gpa, storage.storage(), 7, &bc);
+    defer r.deinit();
+
+    const a = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a.present);
+
+    const after_first = fs.call_count;
+    // Second get of the same key: footer is on-struct, bloom + index +
+    // data all hit the shared cache → zero additional rangeGets.
+    const a2 = (try r.get("alpha", gpa)).?;
+    defer gpa.free(a2.present);
+    try testing.expectEqual(after_first, fs.call_count);
 }

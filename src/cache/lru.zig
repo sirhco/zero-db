@@ -97,6 +97,13 @@ pub fn LRU(comptime K: type, comptime V: type) type {
             value: V,
         };
 
+        /// Evict the least-recently-used entry and return it. Used by
+        /// byte-bounded wrappers (e.g. BlockCache) that need to drop
+        /// entries one at a time until under their own ceiling.
+        pub fn popLru(self: *Self) ?Evicted {
+            return self.evictTail();
+        }
+
         fn evictTail(self: *Self) ?Evicted {
             const tail_node = self.list.pop() orelse return null;
             const node: *Node = @fieldParentPtr("list_node", tail_node);

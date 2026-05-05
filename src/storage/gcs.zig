@@ -12,6 +12,7 @@
 //! header when one is set; production token refresh lives in `auth.zig`.
 
 const std = @import("std");
+const auth = @import("auth.zig");
 
 pub const Error = error{
     EmptyRange,
@@ -23,6 +24,8 @@ pub const Error = error{
     OutOfMemory,
     UrlBufferTooSmall,
     NotImplemented,
+    PutFailed,
+    PutUnsupported,
 };
 
 pub const DEFAULT_BASE_URL: []const u8 = "https://storage.googleapis.com";
@@ -38,8 +41,9 @@ pub const Response = struct {
     body_len: usize,
 };
 
-/// Pluggable HTTP transport. Anything that can answer `GET <url> + headers`
-/// by populating a `body_dst` buffer satisfies this interface.
+/// Pluggable HTTP transport. Implementations answer `GET` (range reads)
+/// and `PUT` (whole-object uploads). Other verbs are out of scope; add a
+/// vtable slot if a future phase needs DELETE or HEAD.
 pub const HttpTransport = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -49,20 +53,36 @@ pub const HttpTransport = struct {
         /// bytes into `body_dst` and return the actual count via
         /// `Response.body_len`. Status is the HTTP status code.
         get: *const fn (ptr: *anyopaque, url: []const u8, headers: []const Header, body_dst: []u8) anyerror!Response,
+        /// Synchronous PUT. Implementations must accept the entire `body`
+        /// and return `Response.status`. `Response.body_len` is unused by
+        /// callers but should be set to 0.
+        put: *const fn (ptr: *anyopaque, url: []const u8, headers: []const Header, body: []const u8) anyerror!Response,
     };
 
     pub fn get(self: HttpTransport, url: []const u8, headers: []const Header, body_dst: []u8) anyerror!Response {
         return self.vtable.get(self.ptr, url, headers, body_dst);
+    }
+
+    pub fn put(self: HttpTransport, url: []const u8, headers: []const Header, body: []const u8) anyerror!Response {
+        return self.vtable.put(self.ptr, url, headers, body);
+    }
+
+    /// Default `put` impl for transports that intentionally do not support
+    /// uploads (e.g. token-fetch transports). Returns `error.PutUnsupported`.
+    pub fn unsupportedPut(_: *anyopaque, _: []const u8, _: []const Header, _: []const u8) anyerror!Response {
+        return error.PutUnsupported;
     }
 };
 
 pub const Options = struct {
     /// Override for tests / staging. Must NOT have a trailing slash.
     base_url: []const u8 = DEFAULT_BASE_URL,
-    /// Optional bearer token. When set, every request carries
-    /// `Authorization: Bearer <token>`. Lifetime: borrowed; caller keeps
-    /// the token string alive.
+    /// Static bearer token. Used only when `token_source` is null. Carried
+    /// verbatim as `Authorization: Bearer <token>`. Lifetime: borrowed.
     bearer_token: ?[]const u8 = null,
+    /// Token source consulted before every request; supersedes
+    /// `bearer_token` when both are set. Lifetime: borrowed.
+    token_source: ?*auth.TokenSource = null,
 };
 
 pub const Client = struct {
@@ -106,7 +126,11 @@ pub const Client = struct {
         // sized for a typical OAuth2 access token.
         var auth_buf: [512]u8 = undefined;
         var auth_value: ?[]const u8 = null;
-        if (self.options.bearer_token) |t| {
+        if (self.options.token_source) |ts| {
+            const tok = ts.token() catch return error.AuthFailed;
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
+                return error.AuthFailed;
+        } else if (self.options.bearer_token) |t| {
             auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
                 return error.AuthFailed;
         }
@@ -131,6 +155,56 @@ pub const Client = struct {
             };
         }
         return resp.body_len;
+    }
+
+    /// `PUT <base>/<bucket>/<object>` with `body` as the object payload.
+    /// Uses the GCS XML API simple upload — same URL shape as `rangeGet`.
+    /// Returns on success (status 200/201). Maps non-2xx to `error.PutFailed`,
+    /// 401/403 to `error.AuthFailed`.
+    pub fn putObject(
+        self: *Client,
+        bucket: []const u8,
+        object: []const u8,
+        body: []const u8,
+    ) Error!void {
+        var url_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer url_arena.deinit();
+        const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
+            return error.InvalidObject;
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_value: ?[]const u8 = null;
+        if (self.options.token_source) |ts| {
+            const tok = ts.token() catch return error.AuthFailed;
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
+                return error.AuthFailed;
+        } else if (self.options.bearer_token) |t| {
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
+                return error.AuthFailed;
+        }
+
+        var len_buf: [32]u8 = undefined;
+        const len_value = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch
+            return error.OutOfMemory;
+
+        var headers: [3]Header = undefined;
+        var n: usize = 2;
+        headers[0] = .{ .name = "Content-Type", .value = "application/octet-stream" };
+        headers[1] = .{ .name = "Content-Length", .value = len_value };
+        if (auth_value) |av| {
+            headers[2] = .{ .name = "Authorization", .value = av };
+            n = 3;
+        }
+
+        const resp = self.transport.put(url, headers[0..n], body) catch
+            return error.HttpError;
+
+        if (resp.status != 200 and resp.status != 201) {
+            return switch (resp.status) {
+                401, 403 => error.AuthFailed,
+                else => error.PutFailed,
+            };
+        }
     }
 };
 
@@ -232,6 +306,16 @@ pub const FakeServer = struct {
     /// happy-path setup.
     forced_status: ?u16 = null,
 
+    /// When set, the next PUT returns this status without storing the body.
+    /// Cleared after one use. Lets tests exercise the "manifest PUT failed
+    /// after SSTable PUT succeeded" scenario.
+    forced_put_status: ?u16 = null,
+
+    /// PUT bodies received during the test, keyed by URL. Survives subsequent
+    /// GETs of the same URL — that round-trip is the headline test of
+    /// Phase 12.
+    received_puts: std.StringHashMap([]u8),
+
     // Recorded request data — gpa-owned dupes; freed in deinit.
     last_url: ?[]u8 = null,
     last_auth_seen: ?[]u8 = null,
@@ -239,6 +323,7 @@ pub const FakeServer = struct {
     last_range_end: u64 = 0,
     last_range_header_seen: bool = false,
     call_count: u32 = 0,
+    put_count: u32 = 0,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -253,12 +338,19 @@ pub const FakeServer = struct {
             .bucket = bucket,
             .object = object,
             .object_bytes = object_bytes,
+            .received_puts = std.StringHashMap([]u8).init(gpa),
         };
     }
 
     pub fn deinit(self: *FakeServer) void {
         if (self.last_url) |u| self.gpa.free(u);
         if (self.last_auth_seen) |a| self.gpa.free(a);
+        var it = self.received_puts.iterator();
+        while (it.next()) |entry| {
+            self.gpa.free(entry.key_ptr.*);
+            self.gpa.free(entry.value_ptr.*);
+        }
+        self.received_puts.deinit();
         self.* = undefined;
     }
 
@@ -266,16 +358,16 @@ pub const FakeServer = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    const vtable: HttpTransport.VTable = .{ .get = getImpl };
+    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl };
 
     fn recordUrl(self: *FakeServer, url: []const u8) !void {
         if (self.last_url) |u| self.gpa.free(u);
         self.last_url = try self.gpa.dupe(u8, url);
     }
 
-    fn recordAuth(self: *FakeServer, auth: ?[]const u8) !void {
+    fn recordAuth(self: *FakeServer, auth_value: ?[]const u8) !void {
         if (self.last_auth_seen) |a| self.gpa.free(a);
-        self.last_auth_seen = if (auth) |x| try self.gpa.dupe(u8, x) else null;
+        self.last_auth_seen = if (auth_value) |x| try self.gpa.dupe(u8, x) else null;
     }
 
     fn getImpl(
@@ -289,13 +381,6 @@ pub const FakeServer = struct {
         try self.recordUrl(url);
         try self.recordAuth(findHeader(headers, "Authorization"));
         self.last_range_header_seen = false;
-
-        // URL must match base + bucket + object exactly.
-        var expected_buf: [4096]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&expected_buf);
-        const expected = buildObjectUrl(fba.allocator(), self.base_url, self.bucket, self.object) catch
-            return error.OutOfMemory;
-        if (!std.mem.eql(u8, url, expected)) return Response{ .status = 404, .body_len = 0 };
 
         // Auth check, if configured.
         if (self.expected_token) |want| {
@@ -322,14 +407,166 @@ pub const FakeServer = struct {
         self.last_range_start = r.start;
         self.last_range_end = r.end;
 
-        // Slice the requested span out of the object bytes.
-        if (r.start >= self.object_bytes.len) return Response{ .status = 416, .body_len = 0 };
-        const end_clamped: usize = @intCast(@min(r.end, @as(u64, self.object_bytes.len) - 1));
+        // Resolve the source bytes: PUT-stored objects shadow the legacy
+        // single-object path, allowing put -> get round trips.
+        const source_bytes = self.resolveBytes(url) orelse
+            return Response{ .status = 404, .body_len = 0 };
+
+        if (r.start >= source_bytes.len) return Response{ .status = 416, .body_len = 0 };
+        const end_clamped: usize = @intCast(@min(r.end, @as(u64, source_bytes.len) - 1));
         const want_len: usize = end_clamped - @as(usize, @intCast(r.start)) + 1;
         const n: usize = @min(want_len, body_dst.len);
         const s: usize = @intCast(r.start);
-        @memcpy(body_dst[0..n], self.object_bytes[s .. s + n]);
+        @memcpy(body_dst[0..n], source_bytes[s .. s + n]);
         return Response{ .status = 206, .body_len = n };
+    }
+
+    fn resolveBytes(self: *FakeServer, url: []const u8) ?[]const u8 {
+        var expected_buf: [4096]u8 = undefined;
+        var fba = std.heap.FixedBufferAllocator.init(&expected_buf);
+        const expected = buildObjectUrl(fba.allocator(), self.base_url, self.bucket, self.object) catch
+            return null;
+        if (std.mem.eql(u8, url, expected)) return self.object_bytes;
+        if (self.received_puts.get(url)) |body| return body;
+        return null;
+    }
+
+    fn putImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+        body: []const u8,
+    ) anyerror!Response {
+        const self: *FakeServer = @ptrCast(@alignCast(ptr));
+        self.put_count += 1;
+        try self.recordUrl(url);
+        try self.recordAuth(findHeader(headers, "Authorization"));
+
+        if (self.expected_token) |want| {
+            const got = self.last_auth_seen orelse return Response{ .status = 401, .body_len = 0 };
+            const prefix = "Bearer ";
+            if (!std.mem.startsWith(u8, got, prefix) or
+                !std.mem.eql(u8, got[prefix.len..], want))
+            {
+                return Response{ .status = 401, .body_len = 0 };
+            }
+        }
+
+        if (self.forced_put_status) |s| {
+            self.forced_put_status = null;
+            return Response{ .status = s, .body_len = 0 };
+        }
+
+        const url_copy = try self.gpa.dupe(u8, url);
+        errdefer self.gpa.free(url_copy);
+        const body_copy = try self.gpa.dupe(u8, body);
+        errdefer self.gpa.free(body_copy);
+
+        if (self.received_puts.fetchRemove(url)) |old| {
+            self.gpa.free(old.key);
+            self.gpa.free(old.value);
+        }
+        try self.received_puts.put(url_copy, body_copy);
+        return Response{ .status = 200, .body_len = 0 };
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RealTransport — production HttpTransport over std.http.Client.
+// ---------------------------------------------------------------------------
+
+/// Production `HttpTransport` backed by `std.http.Client`. Owns the
+/// underlying client across requests so connections can be reused. Caller
+/// supplies an `Io` instance (typically from `std.Io.Threaded.init`) at
+/// construction so transport selection composes with the rest of the
+/// program's I/O strategy.
+///
+/// Body bytes stream into a temporary `std.Io.Writer.Allocating` and are
+/// then memcpy'd into the caller's `body_dst`, capped at `body_dst.len`.
+/// `Response.body_len` reports the count actually written.
+///
+/// Lifetime: caller constructs once at startup and shares across
+/// `gcs.Client`s.
+pub const RealTransport = struct {
+    gpa: std.mem.Allocator,
+    inner: std.http.Client,
+
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) RealTransport {
+        return .{
+            .gpa = gpa,
+            .inner = .{ .allocator = gpa, .io = io },
+        };
+    }
+
+    pub fn deinit(self: *RealTransport) void {
+        self.inner.deinit();
+        self.* = undefined;
+    }
+
+    pub fn transport(self: *RealTransport) HttpTransport {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl };
+
+    fn translateHeaders(headers: []const Header, dst: *[16]std.http.Header) ![]const std.http.Header {
+        if (headers.len > dst.len) return error.BodyTooLarge;
+        for (headers, 0..) |h, i| {
+            dst[i] = .{ .name = h.name, .value = h.value };
+        }
+        return dst[0..headers.len];
+    }
+
+    fn getImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+        body_dst: []u8,
+    ) anyerror!Response {
+        const self: *RealTransport = @ptrCast(@alignCast(ptr));
+
+        var stack_headers: [16]std.http.Header = undefined;
+        const extra = try translateHeaders(headers, &stack_headers);
+
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+
+        const result = try self.inner.fetch(.{
+            .location = .{ .url = url },
+            .method = .GET,
+            .extra_headers = extra,
+            .response_writer = &aw.writer,
+        });
+
+        const body = aw.written();
+        const n = @min(body_dst.len, body.len);
+        @memcpy(body_dst[0..n], body[0..n]);
+        return .{ .status = @intFromEnum(result.status), .body_len = n };
+    }
+
+    fn putImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+        body: []const u8,
+    ) anyerror!Response {
+        const self: *RealTransport = @ptrCast(@alignCast(ptr));
+
+        var stack_headers: [16]std.http.Header = undefined;
+        const extra = try translateHeaders(headers, &stack_headers);
+
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+
+        const result = try self.inner.fetch(.{
+            .location = .{ .url = url },
+            .method = .PUT,
+            .payload = body,
+            .extra_headers = extra,
+            .response_writer = &aw.writer,
+        });
+
+        return .{ .status = @intFromEnum(result.status), .body_len = 0 };
     }
 };
 
@@ -515,4 +752,243 @@ test "Client.rangeGet: rejects zero-length" {
     defer c.deinit();
     var dst: [4]u8 = undefined;
     try testing.expectError(error.EmptyRange, c.rangeGet("b", "o", 0, 0, &dst));
+}
+
+// ---------------------------------------------------------------------------
+// RealTransport tests — drive a localhost std.Io.net + std.http.Server.
+// ---------------------------------------------------------------------------
+
+const LoopbackArgs = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    response_status: std.http.Status,
+    response_body: []const u8,
+    seen_url_path: [256]u8 = undefined,
+    seen_url_path_len: usize = 0,
+    seen_range_value: [128]u8 = undefined,
+    seen_range_len: usize = 0,
+    seen_authorization: [256]u8 = undefined,
+    seen_authorization_len: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn loopbackServeOnce(args: *LoopbackArgs) void {
+    loopbackServeOnceInner(args) catch |e| {
+        args.err = e;
+    };
+}
+
+fn loopbackServeOnceInner(args: *LoopbackArgs) !void {
+    var stream = try args.server.accept(args.io);
+    defer stream.close(args.io);
+
+    var read_buf: [4096]u8 = undefined;
+    var write_buf: [4096]u8 = undefined;
+    var sr = stream.reader(args.io, &read_buf);
+    var sw = stream.writer(args.io, &write_buf);
+    var http_server = std.http.Server.init(&sr.interface, &sw.interface);
+
+    var req = try http_server.receiveHead();
+
+    // Record observed URL path.
+    const path = req.head.target;
+    args.seen_url_path_len = @min(path.len, args.seen_url_path.len);
+    @memcpy(args.seen_url_path[0..args.seen_url_path_len], path[0..args.seen_url_path_len]);
+
+    // Record selected request headers.
+    var it = req.iterateHeaders();
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "Range")) {
+            args.seen_range_len = @min(h.value.len, args.seen_range_value.len);
+            @memcpy(args.seen_range_value[0..args.seen_range_len], h.value[0..args.seen_range_len]);
+        } else if (std.ascii.eqlIgnoreCase(h.name, "Authorization")) {
+            args.seen_authorization_len = @min(h.value.len, args.seen_authorization.len);
+            @memcpy(args.seen_authorization[0..args.seen_authorization_len], h.value[0..args.seen_authorization_len]);
+        }
+    }
+
+    try req.respond(args.response_body, .{ .status = args.response_status });
+}
+
+test "RealTransport: forwards URL + Range header to a localhost std.http.Server" {
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var args: LoopbackArgs = .{
+        .io = io,
+        .server = &server,
+        .response_status = .partial_content,
+        .response_body = "partial-bytes",
+    };
+    const server_thread = try std.Thread.spawn(.{}, loopbackServeOnce, .{&args});
+
+    var rt = RealTransport.init(gpa, io);
+    defer rt.deinit();
+    var url_buf: [256]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/bk/obj.sst", .{bound_port});
+
+    var dst: [32]u8 = undefined;
+    const headers = [_]Header{.{ .name = "Range", .value = "bytes=4-15" }};
+    const r = try rt.transport().get(url, &headers, &dst);
+    server_thread.join();
+
+    if (args.err) |e| return e;
+    try testing.expectEqual(@as(u16, 206), r.status);
+    try testing.expectEqualStrings("/bk/obj.sst", args.seen_url_path[0..args.seen_url_path_len]);
+    try testing.expectEqualStrings("bytes=4-15", args.seen_range_value[0..args.seen_range_len]);
+    try testing.expectEqualStrings("partial-bytes", dst[0..r.body_len]);
+}
+
+test "RealTransport: maps a 401 response to status=401" {
+    const gpa = testing.allocator;
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const addr = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    const bound_port = server.socket.address.getPort();
+
+    var args: LoopbackArgs = .{
+        .io = io,
+        .server = &server,
+        .response_status = .unauthorized,
+        .response_body = "unauthorized\n",
+    };
+    const server_thread = try std.Thread.spawn(.{}, loopbackServeOnce, .{&args});
+
+    var rt = RealTransport.init(gpa, io);
+    defer rt.deinit();
+    var url_buf: [128]u8 = undefined;
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/x", .{bound_port});
+
+    var dst: [32]u8 = undefined;
+    const headers = [_]Header{};
+    const r = try rt.transport().get(url, &headers, &dst);
+    server_thread.join();
+
+    if (args.err) |e| return e;
+    try testing.expectEqual(@as(u16, 401), r.status);
+}
+
+// ---------------------------------------------------------------------------
+// TokenSource wiring tests — Client.rangeGet must consult token_source first.
+// ---------------------------------------------------------------------------
+
+test "Client.rangeGet: pulls bearer from TokenSource and rotates across calls" {
+    const gpa = testing.allocator;
+
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "obj.sst", "abcdefgh");
+    defer fs.deinit();
+
+    const RotatingMeta = struct {
+        n: u32 = 0,
+
+        pub fn transport(self: *@This()) HttpTransport {
+            return .{ .ptr = @ptrCast(self), .vtable = &vt };
+        }
+        const vt: HttpTransport.VTable = .{ .get = getImpl, .put = HttpTransport.unsupportedPut };
+        fn getImpl(p: *anyopaque, _: []const u8, _: []const Header, body_dst: []u8) anyerror!Response {
+            const self: *@This() = @ptrCast(@alignCast(p));
+            self.n += 1;
+            // First call: short expiry forces refresh on the second rangeGet.
+            // Second call: long expiry; would not refresh again on a third.
+            const json = if (self.n == 1)
+                "{\"access_token\":\"tok-A\",\"expires_in\":1}"
+            else
+                "{\"access_token\":\"tok-B\",\"expires_in\":3600}";
+            const n = @min(body_dst.len, json.len);
+            @memcpy(body_dst[0..n], json[0..n]);
+            return .{ .status = 200, .body_len = n };
+        }
+    };
+    var meta = RotatingMeta{};
+
+    var ts = auth.TokenSource.init(
+        gpa,
+        meta.transport(),
+        auth.DEFAULT_METADATA_URL,
+        auth.SystemClock.clock(),
+    );
+    defer ts.deinit();
+
+    var c = Client.init(gpa, fs.transport(), .{ .token_source = &ts });
+    defer c.deinit();
+
+    var dst: [3]u8 = undefined;
+
+    fs.expected_token = "tok-A";
+    _ = try c.rangeGet("bk", "obj.sst", 0, 3, &dst);
+    try testing.expectEqualStrings("Bearer tok-A", fs.last_auth_seen.?);
+
+    fs.expected_token = "tok-B";
+    _ = try c.rangeGet("bk", "obj.sst", 0, 3, &dst);
+    try testing.expectEqualStrings("Bearer tok-B", fs.last_auth_seen.?);
+
+    try testing.expectEqual(@as(u32, 2), meta.n);
+}
+
+// ---------------------------------------------------------------------------
+// putObject tests — exercise PUT path + put -> get round trip via FakeServer.
+// ---------------------------------------------------------------------------
+
+test "Client.putObject: round-trips body through FakeServer" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "legacy.sst", "");
+    defer fs.deinit();
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    const payload = "hello-from-phase-12-payload-bytes";
+    try c.putObject("bk", "sstables/000001.sst", payload);
+    try testing.expectEqual(@as(u32, 1), fs.put_count);
+
+    var dst: [64]u8 = undefined;
+    const n = try c.rangeGet("bk", "sstables/000001.sst", 0, payload.len, &dst);
+    try testing.expectEqual(payload.len, n);
+    try testing.expectEqualSlices(u8, payload, dst[0..n]);
+}
+
+test "Client.putObject: forwards Authorization header" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "x", "");
+    defer fs.deinit();
+    fs.expected_token = "tok-put";
+    var c = Client.init(gpa, fs.transport(), .{ .bearer_token = "tok-put" });
+    defer c.deinit();
+
+    try c.putObject("bk", "sstables/000001.sst", "payload");
+    try testing.expectEqualStrings("Bearer tok-put", fs.last_auth_seen.?);
+}
+
+test "Client.putObject: non-2xx maps to PutFailed" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "x", "");
+    defer fs.deinit();
+    fs.forced_put_status = 500;
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    try testing.expectError(error.PutFailed, c.putObject("bk", "obj", "data"));
+}
+
+test "Client.putObject: 401 maps to AuthFailed" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "x", "");
+    defer fs.deinit();
+    fs.expected_token = "secret";
+    var c = Client.init(gpa, fs.transport(), .{}); // no token configured
+    defer c.deinit();
+
+    try testing.expectError(error.AuthFailed, c.putObject("bk", "obj", "data"));
 }

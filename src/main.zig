@@ -65,6 +65,25 @@ fn serve(init: std.process.Init, log: *Io.Writer) !void {
 
     const port = parsePort(init.environ_map.*) orelse 8080;
 
+    // Production wiring (enabled in Phase 18, the Cloud Run packaging
+    // phase). Sketch:
+    //
+    //     var rt = zero_db.gcs.RealTransport.init(gpa, io);
+    //     defer rt.deinit();
+    //     var ts = zero_db.auth.TokenSource.init(
+    //         gpa,
+    //         rt.transport(),
+    //         zero_db.auth.DEFAULT_METADATA_URL,
+    //         zero_db.auth.SystemClock.clock(),
+    //     );
+    //     defer ts.deinit();
+    //     var client = zero_db.gcs.Client.init(gpa, rt.transport(), .{ .token_source = &ts });
+    //     defer client.deinit();
+    //     // engine.init takes (..., bucket, manifest_object, &client) once
+    //     // Phase 12 lands the upload + manifest path.
+    //
+    // Until Phase 12, the engine remains in-memory only on cold start.
+
     var engine = try zero_db.engine.Engine.init(gpa, .{});
     defer engine.deinit();
 
