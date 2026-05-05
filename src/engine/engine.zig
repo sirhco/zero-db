@@ -26,6 +26,7 @@ const blob = @import("../storage/blob.zig");
 const gcs = @import("../storage/gcs.zig");
 const gcs_storage_mod = @import("../storage/gcs_storage.zig");
 const manifest_mod = @import("../sstable/manifest.zig");
+const block_cache_mod = @import("../cache/block_cache.zig");
 
 pub const MemTable = memtable_mod.MemTable;
 
@@ -58,6 +59,11 @@ pub const Options = struct {
     gcs_client: ?*gcs.Client = null,
     bucket: []const u8 = "",
     manifest_object: []const u8 = "manifest.json",
+
+    /// Bytes-bounded BlockCache shared across every Reader the engine
+    /// constructs. 0 disables the cache (Readers fall back to per-struct
+    /// caching). Default 64 MiB.
+    block_cache_bytes: usize = 64 * 1024 * 1024,
 };
 
 pub const Engine = struct {
@@ -83,6 +89,12 @@ pub const Engine = struct {
     /// serialized form is putObject'd back to GCS.
     manifest: ?manifest_mod.Manifest = null,
 
+    /// Shared BlockCache threaded into every Reader the engine constructs.
+    /// Heap-allocated so its address is stable across moves of `Engine`
+    /// (Engine.init constructs and returns by value; pointers captured
+    /// into the engine's stack-local storage would dangle).
+    block_cache: ?*block_cache_mod.BlockCache = null,
+
     pub fn init(gpa: std.mem.Allocator, options: Options) !Engine {
         var e: Engine = .{
             .gpa = gpa,
@@ -90,6 +102,16 @@ pub const Engine = struct {
             .active = try MemTable.init(gpa),
         };
         errdefer e.active.deinit();
+
+        if (options.block_cache_bytes > 0) {
+            const bc = try gpa.create(block_cache_mod.BlockCache);
+            bc.* = block_cache_mod.BlockCache.init(gpa, options.block_cache_bytes);
+            e.block_cache = bc;
+        }
+        errdefer if (e.block_cache) |bc| {
+            bc.deinit();
+            gpa.destroy(bc);
+        };
 
         if (options.gcs_client != null) {
             try e.loadFromManifest();
@@ -108,9 +130,17 @@ pub const Engine = struct {
         self.frozen_tables.deinit(self.gpa);
 
         if (self.manifest) |*m| m.deinit();
+        if (self.block_cache) |bc| {
+            bc.deinit();
+            self.gpa.destroy(bc);
+        }
 
         self.active.deinit();
         self.* = undefined;
+    }
+
+    fn cachePtr(self: *Engine) ?*block_cache_mod.BlockCache {
+        return self.block_cache;
     }
 
     fn loadFromManifest(self: *Engine) Error!void {
@@ -437,12 +467,16 @@ pub const Engine = struct {
         errdefer self.gpa.destroy(ms);
         ms.* = blob.MemoryStorage.init(sst_bytes);
 
-        const r = try self.gpa.create(reader_mod.Reader);
-        errdefer self.gpa.destroy(r);
-        r.* = reader_mod.Reader.init(self.gpa, ms.storage());
-
         const id = self.next_sstable_id;
         self.next_sstable_id += 1;
+
+        const r = try self.gpa.create(reader_mod.Reader);
+        errdefer self.gpa.destroy(r);
+        r.* = if (self.cachePtr()) |bc|
+            reader_mod.Reader.initWithCache(self.gpa, ms.storage(), id, bc)
+        else
+            reader_mod.Reader.init(self.gpa, ms.storage());
+
         return .{
             .id = id,
             .backing = .{ .memory = .{ .bytes = sst_bytes, .ms = ms } },
@@ -470,7 +504,10 @@ pub const Engine = struct {
 
         const r = try self.gpa.create(reader_mod.Reader);
         errdefer self.gpa.destroy(r);
-        r.* = reader_mod.Reader.init(self.gpa, gs.storage());
+        r.* = if (self.cachePtr()) |bc|
+            reader_mod.Reader.initWithCache(self.gpa, gs.storage(), id, bc)
+        else
+            reader_mod.Reader.init(self.gpa, gs.storage());
 
         return .{
             .id = id,
@@ -900,6 +937,61 @@ test "Engine: flush failure on manifest PUT leaves engine state intact" {
     // The engine has not lost the writes — they were never moved to a
     // durable SSTable. Future flush attempts can still succeed.
     try testing.expect(e.manifest != null);
+}
+
+test "Engine: BlockCache eliminates redundant rangeGets across get/get on same keys" {
+    const gpa = testing.allocator;
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "unused", "");
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var e = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 1024 * 1024,
+    });
+    defer e.deinit();
+
+    try e.set("alpha", "AAA");
+    try e.set("bravo", "BB");
+    try e.flush();
+    try e.set("charlie", "CCC");
+    try e.set("delta", "DDDD");
+    try e.flush();
+    try testing.expectEqual(@as(usize, 2), e.sstableCount());
+
+    // First get warms the BlockCache for both SSTables on the keys we
+    // touch. Counter-baseline.
+    {
+        const a = (try e.get("alpha", gpa)).?;
+        defer gpa.free(a);
+        try testing.expectEqualStrings("AAA", a);
+    }
+    {
+        const c = (try e.get("charlie", gpa)).?;
+        defer gpa.free(c);
+        try testing.expectEqualStrings("CCC", c);
+    }
+
+    const baseline = fs.call_count;
+
+    // Repeat — every metadata block is now in the BlockCache, every
+    // already-fetched data block is too. Expect zero additional rangeGets.
+    {
+        const a2 = (try e.get("alpha", gpa)).?;
+        defer gpa.free(a2);
+        try testing.expectEqualStrings("AAA", a2);
+    }
+    {
+        const c2 = (try e.get("charlie", gpa)).?;
+        defer gpa.free(c2);
+        try testing.expectEqualStrings("CCC", c2);
+    }
+
+    try testing.expectEqual(baseline, fs.call_count);
 }
 
 test "Engine: pre-seeded bucket boots with prior SSTables visible" {
