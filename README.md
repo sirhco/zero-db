@@ -4,6 +4,8 @@
 
 Serverless key-value store written in Zig, designed to run on Google Cloud Run with Google Cloud Storage as the persistent layer.
 
+**New here?** Read [`docs/OVERVIEW.md`](docs/OVERVIEW.md) for the end-user pitch — what Zero-DB is, how the read/write path works end-to-end, when to pick it over Firestore / Memorystore / Cloud SQL, and the cost + latency model.
+
 ## Architecture
 
 LSM-tree shaped, single-writer / multi-reader:
