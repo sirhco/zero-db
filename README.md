@@ -78,7 +78,6 @@ The runtime service account needs `roles/storage.objectAdmin` on the bucket. Tok
 
 ## Roadmap
 
-Detailed in `docs/superpowers/plans/2026-05-03-zero-db-completion-roadmap.md`. Per-phase plans land under `docs/superpowers/plans/` as each phase begins.
 
 | Phase | Theme | Status |
 |-------|-------|--------|
