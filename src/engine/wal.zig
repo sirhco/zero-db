@@ -55,6 +55,13 @@ pub const Wal = struct {
         self.* = undefined;
     }
 
+    /// Current file size in bytes — i.e. the byte offset at which the
+    /// next append will land. Used by the engine to snapshot a "WAL is
+    /// committed up to here" position when freezing a MemTable.
+    pub fn size(self: *Wal) !u64 {
+        return lseekEnd(self.fd);
+    }
+
     pub fn appendSet(self: *Wal, key: []const u8, value: []const u8) Error!void {
         try self.appendRecord(TAG_SET, key, value);
     }
@@ -89,12 +96,24 @@ pub const Wal = struct {
     /// `visitor.apply(tag, key, value)` for each. Stops at EOF or the
     /// first corrupt record (treats the tail as a truncated write).
     pub fn replay(self: *Wal, visitor: anytype) Error!void {
-        // Read entire file into memory. WAL files are bounded by
-        // memtable_flush_bytes-ish; for v0 a single allocation is fine.
-        var pos: u64 = 0;
+        try self.replayFrom(visitor, 0);
+    }
+
+    /// Same as `replay` but skips the first `start_offset` bytes —
+    /// records up to that boundary are assumed to already live in an
+    /// SSTable (the engine stamps the offset into the manifest after
+    /// each successful flush).
+    pub fn replayFrom(self: *Wal, visitor: anytype, start_offset: u64) Error!void {
         const sz = lseekEnd(self.fd) catch return error.OpenFailed;
-        _ = lseekSet(self.fd, 0) catch return error.OpenFailed;
-        const buf = self.gpa.alloc(u8, @intCast(sz)) catch return error.OutOfMemory;
+        if (start_offset >= sz) {
+            // Position file at end and bail; nothing to replay.
+            _ = lseekEnd(self.fd) catch return error.OpenFailed;
+            return;
+        }
+        _ = lseekSet(self.fd, @intCast(start_offset)) catch return error.OpenFailed;
+
+        const remaining: usize = @intCast(sz - start_offset);
+        const buf = self.gpa.alloc(u8, remaining) catch return error.OutOfMemory;
         defer self.gpa.free(buf);
         var off: usize = 0;
         while (off < buf.len) {
@@ -102,11 +121,11 @@ pub const Wal = struct {
             if (n == 0) break;
             off += n;
         }
-        // Position the file at end so subsequent appends land correctly.
         _ = lseekEnd(self.fd) catch return error.OpenFailed;
 
+        var pos: usize = 0;
         while (pos < buf.len) {
-            const rec = decodeRecord(buf[@intCast(pos)..]) orelse return; // tail corrupt → stop
+            const rec = decodeRecord(buf[pos..]) orelse return; // tail corrupt → stop
             switch (rec.tag) {
                 TAG_SET => visitor.apply(.set, rec.key, rec.value) catch return error.WriteFailed,
                 TAG_DELETE => visitor.apply(.delete, rec.key, &.{}) catch return error.WriteFailed,

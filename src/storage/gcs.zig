@@ -26,6 +26,8 @@ pub const Error = error{
     NotImplemented,
     PutFailed,
     PutUnsupported,
+    DeleteFailed,
+    DeleteUnsupported,
 };
 
 pub const DEFAULT_BASE_URL: []const u8 = "https://storage.googleapis.com";
@@ -57,6 +59,9 @@ pub const HttpTransport = struct {
         /// and return `Response.status`. `Response.body_len` is unused by
         /// callers but should be set to 0.
         put: *const fn (ptr: *anyopaque, url: []const u8, headers: []const Header, body: []const u8) anyerror!Response,
+        /// Synchronous DELETE. Returns the HTTP status. `Response.body_len`
+        /// unused.
+        delete: *const fn (ptr: *anyopaque, url: []const u8, headers: []const Header) anyerror!Response,
     };
 
     pub fn get(self: HttpTransport, url: []const u8, headers: []const Header, body_dst: []u8) anyerror!Response {
@@ -67,10 +72,18 @@ pub const HttpTransport = struct {
         return self.vtable.put(self.ptr, url, headers, body);
     }
 
+    pub fn delete(self: HttpTransport, url: []const u8, headers: []const Header) anyerror!Response {
+        return self.vtable.delete(self.ptr, url, headers);
+    }
+
     /// Default `put` impl for transports that intentionally do not support
     /// uploads (e.g. token-fetch transports). Returns `error.PutUnsupported`.
     pub fn unsupportedPut(_: *anyopaque, _: []const u8, _: []const Header, _: []const u8) anyerror!Response {
         return error.PutUnsupported;
+    }
+
+    pub fn unsupportedDelete(_: *anyopaque, _: []const u8, _: []const Header) anyerror!Response {
+        return error.DeleteUnsupported;
     }
 };
 
@@ -206,6 +219,49 @@ pub const Client = struct {
             };
         }
     }
+
+    /// `DELETE <base>/<bucket>/<object>`. Returns success on 200 / 204.
+    /// 404 (object did not exist) is folded into success — callers using
+    /// this to GC orphan objects do not care whether something else
+    /// already reaped the target.
+    pub fn deleteObject(
+        self: *Client,
+        bucket: []const u8,
+        object: []const u8,
+    ) Error!void {
+        var url_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer url_arena.deinit();
+        const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
+            return error.InvalidObject;
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_value: ?[]const u8 = null;
+        if (self.options.token_source) |ts| {
+            const tok = ts.token() catch return error.AuthFailed;
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{tok}) catch
+                return error.AuthFailed;
+        } else if (self.options.bearer_token) |t| {
+            auth_value = std.fmt.bufPrint(&auth_buf, "Bearer {s}", .{t}) catch
+                return error.AuthFailed;
+        }
+
+        var headers: [1]Header = undefined;
+        var n: usize = 0;
+        if (auth_value) |av| {
+            headers[0] = .{ .name = "Authorization", .value = av };
+            n = 1;
+        }
+
+        const resp = self.transport.delete(url, headers[0..n]) catch
+            return error.HttpError;
+
+        if (resp.status != 200 and resp.status != 204 and resp.status != 404) {
+            return switch (resp.status) {
+                401, 403 => error.AuthFailed,
+                else => error.DeleteFailed,
+            };
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -311,6 +367,9 @@ pub const FakeServer = struct {
     /// after SSTable PUT succeeded" scenario.
     forced_put_status: ?u16 = null,
 
+    /// Same one-shot escape hatch for DELETE.
+    forced_delete_status: ?u16 = null,
+
     /// PUT bodies received during the test, keyed by URL. Survives subsequent
     /// GETs of the same URL — that round-trip is the headline test of
     /// Phase 12.
@@ -324,6 +383,7 @@ pub const FakeServer = struct {
     last_range_header_seen: bool = false,
     call_count: u32 = 0,
     put_count: u32 = 0,
+    delete_count: u32 = 0,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -358,7 +418,7 @@ pub const FakeServer = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl };
+    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl };
 
     fn recordUrl(self: *FakeServer, url: []const u8) !void {
         if (self.last_url) |u| self.gpa.free(u);
@@ -469,6 +529,40 @@ pub const FakeServer = struct {
         try self.received_puts.put(url_copy, body_copy);
         return Response{ .status = 200, .body_len = 0 };
     }
+
+    fn deleteImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+    ) anyerror!Response {
+        const self: *FakeServer = @ptrCast(@alignCast(ptr));
+        self.delete_count += 1;
+        try self.recordUrl(url);
+        try self.recordAuth(findHeader(headers, "Authorization"));
+
+        if (self.expected_token) |want| {
+            const got = self.last_auth_seen orelse return Response{ .status = 401, .body_len = 0 };
+            const prefix = "Bearer ";
+            if (!std.mem.startsWith(u8, got, prefix) or
+                !std.mem.eql(u8, got[prefix.len..], want))
+            {
+                return Response{ .status = 401, .body_len = 0 };
+            }
+        }
+
+        if (self.forced_delete_status) |s| {
+            self.forced_delete_status = null;
+            return Response{ .status = s, .body_len = 0 };
+        }
+
+        if (self.received_puts.fetchRemove(url)) |old| {
+            self.gpa.free(old.key);
+            self.gpa.free(old.value);
+            return Response{ .status = 204, .body_len = 0 };
+        }
+        // GCS returns 404 when the object does not exist.
+        return Response{ .status = 404, .body_len = 0 };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -507,7 +601,7 @@ pub const RealTransport = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl };
+    const vtable: HttpTransport.VTable = .{ .get = getImpl, .put = putImpl, .delete = deleteImpl };
 
     fn translateHeaders(headers: []const Header, dst: *[16]std.http.Header) ![]const std.http.Header {
         if (headers.len > dst.len) return error.BodyTooLarge;
@@ -562,6 +656,29 @@ pub const RealTransport = struct {
             .location = .{ .url = url },
             .method = .PUT,
             .payload = body,
+            .extra_headers = extra,
+            .response_writer = &aw.writer,
+        });
+
+        return .{ .status = @intFromEnum(result.status), .body_len = 0 };
+    }
+
+    fn deleteImpl(
+        ptr: *anyopaque,
+        url: []const u8,
+        headers: []const Header,
+    ) anyerror!Response {
+        const self: *RealTransport = @ptrCast(@alignCast(ptr));
+
+        var stack_headers: [16]std.http.Header = undefined;
+        const extra = try translateHeaders(headers, &stack_headers);
+
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+
+        const result = try self.inner.fetch(.{
+            .location = .{ .url = url },
+            .method = .DELETE,
             .extra_headers = extra,
             .response_writer = &aw.writer,
         });
@@ -897,7 +1014,7 @@ test "Client.rangeGet: pulls bearer from TokenSource and rotates across calls" {
         pub fn transport(self: *@This()) HttpTransport {
             return .{ .ptr = @ptrCast(self), .vtable = &vt };
         }
-        const vt: HttpTransport.VTable = .{ .get = getImpl, .put = HttpTransport.unsupportedPut };
+        const vt: HttpTransport.VTable = .{ .get = getImpl, .put = HttpTransport.unsupportedPut, .delete = HttpTransport.unsupportedDelete };
         fn getImpl(p: *anyopaque, _: []const u8, _: []const Header, body_dst: []u8) anyerror!Response {
             const self: *@This() = @ptrCast(@alignCast(p));
             self.n += 1;
@@ -991,4 +1108,46 @@ test "Client.putObject: 401 maps to AuthFailed" {
     defer c.deinit();
 
     try testing.expectError(error.AuthFailed, c.putObject("bk", "obj", "data"));
+}
+
+// ---------------------------------------------------------------------------
+// deleteObject tests
+// ---------------------------------------------------------------------------
+
+test "Client.deleteObject: removes a previously put object" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "legacy", "");
+    defer fs.deinit();
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    try c.putObject("bk", "sstables/orphan.sst", "junk");
+    try c.deleteObject("bk", "sstables/orphan.sst");
+    try testing.expectEqual(@as(u32, 1), fs.delete_count);
+
+    // Subsequent rangeGet of the removed object 404s -> BadStatus.
+    var dst: [4]u8 = undefined;
+    try testing.expectError(error.BadStatus, c.rangeGet("bk", "sstables/orphan.sst", 0, 4, &dst));
+}
+
+test "Client.deleteObject: 404 on missing object is folded into success" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "x", "");
+    defer fs.deinit();
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    try c.deleteObject("bk", "never/existed.sst");
+    try testing.expectEqual(@as(u32, 1), fs.delete_count);
+}
+
+test "Client.deleteObject: forced 500 maps to DeleteFailed" {
+    const gpa = testing.allocator;
+    var fs = FakeServer.init(gpa, DEFAULT_BASE_URL, "bk", "x", "");
+    defer fs.deinit();
+    fs.forced_delete_status = 500;
+    var c = Client.init(gpa, fs.transport(), .{});
+    defer c.deinit();
+
+    try testing.expectError(error.DeleteFailed, c.deleteObject("bk", "obj"));
 }

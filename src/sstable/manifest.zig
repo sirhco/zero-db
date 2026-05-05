@@ -36,6 +36,10 @@ pub const Manifest = struct {
     gpa: std.mem.Allocator,
     version: u32 = CURRENT_VERSION,
     entries: std.ArrayList(Entry),
+    /// Highest WAL byte offset whose records are guaranteed to be in
+    /// some SSTable listed in `entries`. The engine bumps this after
+    /// every successful flush; on cold start, replay skips the prefix.
+    wal_committed_bytes: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator) Manifest {
         return .{ .gpa = gpa, .entries = .empty };
@@ -89,17 +93,24 @@ pub const Manifest = struct {
         const Wire = struct {
             version: u32,
             sstables: []const Entry,
+            wal_committed_bytes: u64,
         };
-        const wire = Wire{ .version = self.version, .sstables = self.entries.items };
+        const wire = Wire{
+            .version = self.version,
+            .sstables = self.entries.items,
+            .wal_committed_bytes = self.wal_committed_bytes,
+        };
         return std.json.Stringify.valueAlloc(self.gpa, wire, .{}) catch error.OutOfMemory;
     }
 
     /// Parse manifest bytes. Returned manifest owns its strings and must
-    /// be `deinit`ed.
+    /// be `deinit`ed. Older manifests without `wal_committed_bytes` are
+    /// accepted and treated as 0.
     pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) Error!Manifest {
         const Wire = struct {
             version: u32 = CURRENT_VERSION,
             sstables: []const Entry = &.{},
+            wal_committed_bytes: u64 = 0,
         };
         var parsed = std.json.parseFromSlice(
             Wire,
@@ -116,6 +127,7 @@ pub const Manifest = struct {
         for (parsed.value.sstables) |e| {
             try m.append(e);
         }
+        m.wal_committed_bytes = parsed.value.wal_committed_bytes;
         return m;
     }
 };

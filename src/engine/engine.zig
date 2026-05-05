@@ -163,6 +163,13 @@ pub const Engine = struct {
     /// `deinit`.
     wal: ?wal_mod.Wal = null,
 
+    /// WAL byte offset captured at the moment a MemTable was frozen.
+    /// Indexed by the heap-allocated MemTable pointer that frozen_tables
+    /// owns. The compactor pulls the value when it splices a flushed
+    /// SSTable, then bumps `manifest.wal_committed_bytes` so on cold
+    /// restart the WAL replay can skip the prefix.
+    pending_wal_offsets: std.AutoHashMapUnmanaged(*MemTable, u64) = .empty,
+
     pub fn init(gpa: std.mem.Allocator, options: Options) !Engine {
         var e: Engine = .{
             .gpa = gpa,
@@ -204,8 +211,9 @@ pub const Engine = struct {
             }
         };
         var v = Visitor{ .engine = self };
+        const start_offset: u64 = if (self.manifest) |m| m.wal_committed_bytes else 0;
         if (self.wal) |*w| {
-            w.replay(&v) catch return error.OutOfMemory;
+            w.replayFrom(&v, start_offset) catch return error.OutOfMemory;
         }
     }
 
@@ -232,6 +240,7 @@ pub const Engine = struct {
             self.gpa.destroy(bc);
         }
         if (self.wal) |*w| w.close();
+        self.pending_wal_offsets.deinit(self.gpa);
 
         self.active.deinit();
         self.* = undefined;
@@ -270,6 +279,21 @@ pub const Engine = struct {
         const should_trigger_merge = blk: {
             self.mu.lock();
             defer self.mu.unlock();
+
+            // Pull this MemTable's captured WAL offset before we tear it
+            // down. Bumping `manifest.wal_committed_bytes` BEFORE
+            // persistAndOpen runs ensures the uploaded manifest carries
+            // the new checkpoint, so cold-restart replay skips records
+            // already in this SSTable.
+            const captured_wal_offset: u64 = if (self.pending_wal_offsets.fetchRemove(mt)) |kv|
+                kv.value
+            else
+                0;
+            if (self.manifest) |*m| {
+                if (captured_wal_offset > m.wal_committed_bytes) {
+                    m.wal_committed_bytes = captured_wal_offset;
+                }
+            }
 
             const handle = if (self.options.gcs_client != null)
                 try self.persistAndOpen(mt, sst_bytes)
@@ -385,6 +409,13 @@ pub const Engine = struct {
     fn flushActive(self: *Engine) Error!void {
         self.active.freeze();
 
+        // Snapshot the WAL offset BEFORE we replace `self.active` — every
+        // record up to this point is reflected in the active MemTable
+        // we're about to freeze. Subsequent records (against the new
+        // active that lives below) sit past this offset and stay in the
+        // WAL until their own flush.
+        const wal_off: u64 = if (self.wal) |*w| (w.size() catch 0) else 0;
+
         // Move the active table into the frozen list. We heap-allocate a
         // new MemTable slot so the frozen list stores stable pointers —
         // the async compactor holds these without disturbing the engine's
@@ -398,6 +429,9 @@ pub const Engine = struct {
                 self.mu.unlock();
                 return err;
             };
+            if (self.wal != null) {
+                self.pending_wal_offsets.put(self.gpa, moved, wal_off) catch {};
+            }
             self.mu.unlock();
         }
         // Past this point `frozen_tables` owns `moved`; errdefer above no
@@ -428,6 +462,17 @@ pub const Engine = struct {
                 error.TooManyEntries => return error.TooManyEntries,
                 error.HeapTooLarge => return error.HeapTooLarge,
             };
+
+            // Pull this MemTable's captured WAL offset and bump the
+            // manifest checkpoint BEFORE persistAndOpen serializes +
+            // uploads, so the persisted manifest carries the new value.
+            if (self.pending_wal_offsets.fetchRemove(ft)) |kv| {
+                if (self.manifest) |*m| {
+                    if (kv.value > m.wal_committed_bytes) {
+                        m.wal_committed_bytes = kv.value;
+                    }
+                }
+            }
 
             if (self.options.gcs_client != null) {
                 // persistAndOpen always consumes sst_bytes (defer free
@@ -594,8 +639,9 @@ pub const Engine = struct {
 
     /// GCS-backed compaction: upload the merged SSTable as a fresh object,
     /// rewrite the manifest with every old entry replaced by the merged
-    /// one, then swap reader handles. Old objects are best-effort orphaned
-    /// (a v0 limitation; Phase 18 adds a GC sweep).
+    /// one, then swap reader handles. Old SSTable objects are best-effort
+    /// deleted via `Client.deleteObject` once the manifest swap is durable;
+    /// failures on the delete are swallowed (orphan objects are harmless).
     fn compactPersistent(self: *Engine, merged: []u8) Error!void {
         defer self.gpa.free(merged);
         const client = self.options.gcs_client.?;
@@ -639,6 +685,21 @@ pub const Engine = struct {
         client.putObject(self.options.bucket, self.options.manifest_object, bytes) catch
             return error.ManifestLoadFailed;
 
+        // Snapshot old object paths before tearing down handles so we can
+        // best-effort delete them after the swap. Each path string is
+        // owned by its handle's backing; copy into local heap so the post-
+        // close DELETE pass can use them.
+        const old_paths = self.gpa.alloc([]u8, self.manifest.?.entries.items.len) catch
+            return error.OutOfMemory;
+        defer {
+            for (old_paths) |p| self.gpa.free(p);
+            self.gpa.free(old_paths);
+        }
+        for (self.manifest.?.entries.items, 0..) |entry, i| {
+            old_paths[i] = self.gpa.dupe(u8, entry.object_path) catch
+                return error.OutOfMemory;
+        }
+
         // Manifest durable. Replace the in-memory mirror with the new one.
         self.manifest.?.deinit();
         self.manifest = manifest_mod.Manifest.init(self.gpa);
@@ -651,6 +712,13 @@ pub const Engine = struct {
 
         const handle = try self.openGcsSSTable(id, object_path, merged.len);
         try self.sstables.append(self.gpa, handle);
+
+        // Best-effort GC of old SSTable objects. Failures here become
+        // orphan objects in the bucket — harmless, picked up by a future
+        // sweep. We deliberately swallow individual delete errors.
+        for (old_paths) |path| {
+            client.deleteObject(self.options.bucket, path) catch {};
+        }
     }
 
     // ---- internals --------------------------------------------------------
@@ -1181,6 +1249,103 @@ test "Engine: startCompactor — async flush still surfaces keys + correct sstab
         defer gpa.free(got);
         try testing.expectEqualStrings(c.want, got);
     }
+}
+
+test "Engine: compaction GCs old SSTable objects after manifest swap" {
+    const gpa = testing.allocator;
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "unused", "");
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var e = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 0,
+    });
+    defer e.deinit();
+
+    try e.set("alpha", "AAA");
+    try e.flush();
+    try e.set("bravo", "BB");
+    try e.flush();
+    try e.set("charlie", "CCC");
+    try e.flush();
+
+    const before_compact = fs.delete_count;
+    try e.compactAll();
+
+    // Three flushed SSTables -> one merged. Best-effort GC should have
+    // attempted three deletes.
+    try testing.expectEqual(before_compact + 3, fs.delete_count);
+    try testing.expectEqual(@as(usize, 1), e.sstableCount());
+
+    const a = (try e.get("alpha", gpa)).?;
+    defer gpa.free(a);
+    try testing.expectEqualStrings("AAA", a);
+}
+
+test "Engine: WAL checkpoint advances past flushed records (no double-replay)" {
+    const gpa = testing.allocator;
+    const pid = std.posix.system.getpid();
+    var path_buf: [128]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&path_buf, "/tmp/zero-db-wal-checkpoint-{d}.log", .{pid});
+    defer {
+        if (gpa.dupeZ(u8, wal_path)) |path_z| {
+            _ = std.posix.system.unlink(path_z.ptr);
+            gpa.free(path_z);
+        } else |_| {}
+    }
+
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "unused", "");
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    {
+        var e = try Engine.init(gpa, .{
+            .gcs_client = &client,
+            .bucket = "bk",
+            .manifest_object = "manifest.json",
+            .block_cache_bytes = 0,
+            .wal_path = wal_path,
+        });
+        defer e.deinit();
+        try e.set("alpha", "AAA");
+        try e.set("bravo", "BB");
+        try e.flush();
+        try e.set("charlie", "CCC"); // post-flush, not yet in any SSTable.
+    }
+
+    // Cold restart. Manifest carries the checkpoint; replay should only
+    // re-apply "charlie", not "alpha"/"bravo".
+    var e2 = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 0,
+        .wal_path = wal_path,
+    });
+    defer e2.deinit();
+
+    // alpha + bravo come from the SSTable; charlie comes from the WAL replay.
+    try testing.expect(e2.manifest.?.wal_committed_bytes > 0);
+
+    // Post-restart, only "charlie" should live in the active MemTable.
+    // (alpha/bravo are in an SSTable, not active.)
+    try testing.expectEqual(@as(u32, 1), e2.entryCountActive());
+
+    const a = (try e2.get("alpha", gpa)).?;
+    defer gpa.free(a);
+    try testing.expectEqualStrings("AAA", a);
+    const b = (try e2.get("bravo", gpa)).?;
+    defer gpa.free(b);
+    try testing.expectEqualStrings("BB", b);
+    const c = (try e2.get("charlie", gpa)).?;
+    defer gpa.free(c);
+    try testing.expectEqualStrings("CCC", c);
 }
 
 test "Engine: WAL replay restores writes lost to in-process crash" {

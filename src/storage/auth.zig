@@ -152,7 +152,7 @@ const TokenServer = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    const vtable: gcs.HttpTransport.VTable = .{ .get = getImpl, .put = gcs.HttpTransport.unsupportedPut };
+    const vtable: gcs.HttpTransport.VTable = .{ .get = getImpl, .put = gcs.HttpTransport.unsupportedPut, .delete = gcs.HttpTransport.unsupportedDelete };
 
     fn getImpl(
         ptr: *anyopaque,
@@ -259,7 +259,7 @@ test "TokenSource: surfaces BadStatus when Metadata-Flavor header missing" {
         pub fn transport(self: *@This()) gcs.HttpTransport {
             return .{ .ptr = @ptrCast(self), .vtable = &vt };
         }
-        const vt: gcs.HttpTransport.VTable = .{ .get = stripGet, .put = gcs.HttpTransport.unsupportedPut };
+        const vt: gcs.HttpTransport.VTable = .{ .get = stripGet, .put = gcs.HttpTransport.unsupportedPut, .delete = gcs.HttpTransport.unsupportedDelete };
         fn stripGet(ptr: *anyopaque, url: []const u8, _: []const gcs.Header, body_dst: []u8) anyerror!gcs.Response {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return TokenServer.getImpl(@ptrCast(self.inner), url, &.{}, body_dst);
