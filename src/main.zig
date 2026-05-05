@@ -87,6 +87,12 @@ fn serve(init: std.process.Init, log: *Io.Writer) !void {
     var engine = try zero_db.engine.Engine.init(gpa, .{});
     defer engine.deinit();
 
+    // Per-request arena pool. Cloud Run typical concurrency is ~80; 32
+    // pooled arenas is a comfortable upper bound on simultaneous in-
+    // flight requests sharing already-mmap'd buffers.
+    var pool = zero_db.arena_pool.ArenaPool.init(gpa, 32);
+    defer pool.deinit();
+
     const addr = try Io.net.IpAddress.parse("0.0.0.0", port);
     var listener = try addr.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
@@ -102,7 +108,7 @@ fn serve(init: std.process.Init, log: *Io.Writer) !void {
         };
         defer stream.close(io);
 
-        handleOne(gpa, io, stream, &engine, log) catch |err| {
+        handleOne(gpa, &pool, io, stream, &engine, log) catch |err| {
             log.print("request failed: {s}\n", .{@errorName(err)}) catch {};
             log.flush() catch {};
         };
@@ -114,16 +120,18 @@ fn parsePort(environ: std.process.Environ.Map) ?u16 {
     return std.fmt.parseInt(u16, raw, 10) catch null;
 }
 
-/// Process a single accepted connection. Builds a per-request arena so
-/// every allocation (decoded keys, value copies, JSON bodies) is freed
-/// when the request finishes.
+/// Process a single accepted connection. Borrows a per-request arena
+/// from the pool so allocations (decoded keys, value copies, JSON
+/// bodies) reuse already-mmap'd capacity from the previous request.
 fn handleOne(
     gpa: std.mem.Allocator,
+    pool: *zero_db.arena_pool.ArenaPool,
     io: Io,
     stream: Io.net.Stream,
     engine: *zero_db.engine.Engine,
     log: *Io.Writer,
 ) !void {
+    _ = gpa; // pool already carries the parent allocator
     var read_buffer: [16 * 1024]u8 = undefined;
     var write_buffer: [16 * 1024]u8 = undefined;
 
@@ -136,8 +144,8 @@ fn handleOne(
         return;
     };
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
-    defer arena_state.deinit();
+    const arena_state = try pool.acquire();
+    defer pool.release(arena_state);
     const arena = arena_state.allocator();
 
     const target_full = http_req.head.target;
