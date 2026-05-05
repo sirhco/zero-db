@@ -1,6 +1,6 @@
 # Zero-DB
 
-> **Status: Alpha (0.0.0).** Not production-ready. On-disk format is unstable. No durability guarantees yet (no WAL). API and module surface will change. Do not store data you cannot afford to lose.
+> **Status: Alpha (0.0.0).** Single-writer only; multi-writer Cloud Run requires manifest preconditions still TBD. On-disk format is unstable across versions. API and module surface will continue to evolve. Cold-restart durability via GCS + local WAL is in place; do not yet store data without an out-of-band backup.
 
 Serverless key-value store written in Zig, designed to run on Google Cloud Run with Google Cloud Storage as the persistent layer.
 
@@ -24,19 +24,26 @@ Every data block ends with a 4-byte CRC32C trailer (Castagnoli) — corruption s
 
 The "secret sauce" is Zig's manual memory model: the read path stays off any GC, hot keys come from packed in-RAM structures with `@bitCast` zero-parse access, per-request `FixedBufferAllocator` arenas keep allocation churn off the steady-state path.
 
-## What's Implemented (as of Phase 10)
+## What's Implemented (as of Phase 18)
 
-- **Engine** — LSM orchestrator with set/get/delete, flush, and full compaction
+- **Engine** — LSM orchestrator with set/get/delete, flush, full compaction, optional GCS-backed cold-restart durability, optional WAL replay, optional background flush + L0 auto-merge
 - **MemTable** — skiplist with put/putTombstone/get/iterator
 - **SSTable Index Parser** — `@bitCast`-driven, zero-allocation, alignment-safe
-- **SSTable Reader** — footer → bloom → index → data block, lazy + cached
-- **SSTable Writer** — block-rolling builder with bloom + index + footer assembly
+- **SSTable Reader** — footer → bloom → index → data block, lazy + cached, optional shared `BlockCache`
+- **SSTable Writer** — block-rolling builder with bloom + index + footer assembly + per-block CRC32C trailer
+- **Manifest** — JSON-serialized live SSTable list, atomic-per-object rewrite on every flush + compaction
+- **WAL** — local file with fsync-per-record, CRC32C-trailed entries, replay-on-open survives in-process crashes
 - **K-Way Compaction** — merges overlapping SSTables, drops dead tombstones on full passes
 - **Bloom Filter** — Wyhash-based, sized from expected entry count
-- **LRU Cache** — DoublyLinkedList + HashMap (block cache wiring still pending)
-- **GCS Storage Adapter** — `Storage` interface + `gcs.Client` (with `FakeServer` for tests; real HTTP transport pending)
+- **LRU Cache + BlockCache** — bytes-bounded LRU keyed on `(sstable_id, kind, offset)`, shared across every Reader the engine constructs
+- **TrackingAllocator** — bytes-bounded child allocator wrapper; engine surfaces `OverMemoryBudget` from `set` / `delete` once the ceiling is crossed
+- **Background Compactor** — opt-in `Engine.startCompactor()` spawns a worker thread; flushes drain off a queue, L0 ≥ threshold auto-schedules a merge
+- **GCS Storage Adapter** — `Storage` interface + `gcs.Client` with `RealTransport` over `std.http.Client` (production) and `FakeServer` (tests)
+- **GCE Auth** — `auth.TokenSource` fetches + caches + refreshes a bearer token from the GCE metadata service; threads into every `gcs.Client` request
+- **Adaptive Prefetch** — single-step transition learner; reader-side wiring deferred to v1
 - **HTTP Server** — `GET/PUT/DELETE /v1/kv/{key}`, `POST /admin/flush`, `POST /admin/compact`, `GET /admin/stats`, `GET /healthz`
 - **Util** — LEB128 varint, CRC32C (Castagnoli), little-endian assertion
+- **Deploy** — `deploy/Dockerfile` (multi-stage, distroless runtime) + `deploy/deploy.sh` (Artifact Registry + Cloud Run)
 
 ## Build / Run
 
@@ -59,6 +66,16 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zero_db
 ```
 
+### Cloud Run
+
+```bash
+GCP_PROJECT=my-project GCP_REGION=us-central1 \
+  GCS_BUCKET=my-zero-db AR_REPO=zero-db \
+  ./deploy/deploy.sh
+```
+
+The runtime service account needs `roles/storage.objectAdmin` on the bucket. Tokens come from the GCE metadata service automatically — no static credentials. See `deploy/deploy.sh` for full env-var requirements.
+
 ## Roadmap
 
 Detailed in `docs/superpowers/plans/2026-05-03-zero-db-completion-roadmap.md`. Per-phase plans land under `docs/superpowers/plans/` as each phase begins.
@@ -74,28 +91,32 @@ Detailed in `docs/superpowers/plans/2026-05-03-zero-db-completion-roadmap.md`. P
 | 7 | GCS Storage Adapter + HTTP Seams | shipped |
 | 8 | Full Compaction + K-Way Merge | shipped |
 | 9 | HTTP Server + V1 API | shipped |
-| **10** | **Util Backfill (varint + CRC32C) + Data Block CRC Trailer** | **shipped** |
-| 11 | Real HTTP Transport + GCE Auth (token refresh) | next |
-| 12 | GCS Upload Path + Manifest (durable SSTable list) | planned |
-| 13 | Block Cache Wiring (parsed index/bloom + raw data block LRU) | planned |
-| 14 | Memory Ceiling (TrackingAllocator admission control) | planned |
-| 15 | Background Compaction Worker | planned |
-| 16 | WAL Durability (open question: local disk vs. GCS streaming) | planned |
-| 17 | Adaptive Prefetch (co-occurrence-driven Range extension) | planned |
-| 18 | Cloud Run Packaging (Dockerfile, deploy script, IAM) | planned |
+| 10 | Util Backfill (varint + CRC32C) + Data Block CRC Trailer | shipped |
+| 11 | Real HTTP Transport + GCE Auth (token refresh) | shipped |
+| 12 | GCS Upload Path + Manifest (durable SSTable list) | shipped |
+| 13 | Block Cache Wiring (parsed index/bloom + raw data block LRU) | shipped |
+| 14 | Memory Ceiling (TrackingAllocator admission control) | shipped |
+| 15 | Background Compaction Worker (+ L0 auto-merge) | shipped |
+| 16 | WAL Durability (Option A — local file, fsync per record) | shipped |
+| 17 | Adaptive Prefetch (single-step transition learner) | shipped |
+| **18** | **Cloud Run Packaging (Dockerfile, deploy.sh, IAM)** | **shipped** |
+
+Test count grew from 145 (post-Phase 10) to **190** across Phases 11–18.
 
 ## Outstanding Stubs
 
-Modules that still return `error.NotImplemented` or have no behavior:
+Every roadmap stub has been filled. The lone remaining unwired module:
 
-| File | Phase that fills it |
-|------|---------------------|
-| `src/storage/auth.zig` | 11 |
-| `src/cache/block_cache.zig` | 13 |
-| `src/alloc/tracking.zig` | 14 |
-| `src/alloc/arena_pool.zig` | 14 |
-| `src/engine/compaction.zig` (background worker) | 15 |
-| `src/prefetch/adaptive.zig` | 17 |
+| File | Status |
+|------|--------|
+| `src/alloc/arena_pool.zig` | type-only; no consumer needs it yet — wire when a workload demands per-request arena reuse |
+
+## Known v0 Limitations
+
+- **Multi-writer Cloud Run** — manifest rewrite assumes a single writer. Multi-instance deployments need GCS `x-goog-if-generation-match` preconditions before the manifest path is safe.
+- **WAL truncation** — the local WAL grows unbounded; replay walks the whole file on cold start. A future phase will park a `wal_committed_bytes` checkpoint in the manifest so absorbed prefix can be skipped or trimmed.
+- **Adaptive prefetch reader-side wiring** — the tracker exposes hints; the reader does not yet consume them. Wire once production traffic exposes the hot key shapes.
+- **Refresh-on-401** — `TokenSource` refreshes by clock only. A mid-request 401 retry is straightforward future work.
 
 ## Out of Scope (Pre-1.0)
 
