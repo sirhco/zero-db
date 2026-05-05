@@ -27,6 +27,7 @@ const gcs = @import("../storage/gcs.zig");
 const gcs_storage_mod = @import("../storage/gcs_storage.zig");
 const manifest_mod = @import("../sstable/manifest.zig");
 const block_cache_mod = @import("../cache/block_cache.zig");
+const tracking_mod = @import("../alloc/tracking.zig");
 
 pub const MemTable = memtable_mod.MemTable;
 
@@ -34,6 +35,7 @@ pub const Error = error{
     OutOfMemory,
     Frozen,
     ManifestLoadFailed,
+    OverMemoryBudget,
 } || writer.Error || reader_mod.ReaderError;
 
 /// Generous upper bound for the manifest object on cold start. The engine
@@ -64,6 +66,13 @@ pub const Options = struct {
     /// constructs. 0 disables the cache (Readers fall back to per-struct
     /// caching). Default 64 MiB.
     block_cache_bytes: usize = 64 * 1024 * 1024,
+
+    /// Optional `TrackingAllocator` whose ceiling drives admission control
+    /// for new writes. When set, `set` and `delete` short-circuit with
+    /// `error.OverMemoryBudget` once `tracking_allocator.isOverBudget()`.
+    /// When null, the engine accepts writes until the underlying allocator
+    /// itself returns `OutOfMemory`.
+    tracking_allocator: ?*tracking_mod.TrackingAllocator = null,
 };
 
 pub const Engine = struct {
@@ -187,11 +196,17 @@ pub const Engine = struct {
     // ---- write path -------------------------------------------------------
 
     pub fn set(self: *Engine, key: []const u8, value: []const u8) Error!void {
+        if (self.options.tracking_allocator) |ta| {
+            if (ta.isOverBudget()) return error.OverMemoryBudget;
+        }
         try self.active.put(key, value);
         try self.maybeFlush();
     }
 
     pub fn delete(self: *Engine, key: []const u8) Error!void {
+        if (self.options.tracking_allocator) |ta| {
+            if (ta.isOverBudget()) return error.OverMemoryBudget;
+        }
         try self.active.putTombstone(key);
         try self.maybeFlush();
     }
@@ -937,6 +952,33 @@ test "Engine: flush failure on manifest PUT leaves engine state intact" {
     // The engine has not lost the writes — they were never moved to a
     // durable SSTable. Future flush attempts can still succeed.
     try testing.expect(e.manifest != null);
+}
+
+test "Engine: set/delete return OverMemoryBudget when TrackingAllocator over ceiling" {
+    const gpa = testing.allocator;
+    var ta = tracking_mod.TrackingAllocator.init(gpa, 1024 * 1024);
+    const tracked = ta.allocator();
+
+    var e = try Engine.init(tracked, .{
+        .block_cache_bytes = 0,
+        .tracking_allocator = &ta,
+    });
+    defer e.deinit();
+
+    try e.set("alpha", "AAA");
+    try testing.expect(!ta.isOverBudget());
+
+    // Force the ceiling crossing by manually inflating the live counter.
+    ta.live = ta.ceiling;
+    try testing.expectError(error.OverMemoryBudget, e.set("bravo", "BB"));
+    try testing.expectError(error.OverMemoryBudget, e.delete("ghost"));
+
+    // Once below the ceiling again, writes resume.
+    ta.live = 0;
+    try e.set("charlie", "CCC");
+    const c = (try e.get("charlie", gpa)).?;
+    defer gpa.free(c);
+    try testing.expectEqualStrings("CCC", c);
 }
 
 test "Engine: BlockCache eliminates redundant rangeGets across get/get on same keys" {
