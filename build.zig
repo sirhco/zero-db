@@ -156,6 +156,46 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_integration_tests.step);
 
+    // -----------------------------------------------------------------------
+    // Optional C-ABI library. `zig build -Dffi=true` produces
+    // libzero_db.{so,dylib,a} under zig-out/lib and installs zero_db.h
+    // under zig-out/include. Other languages link via FFI; the binary in
+    // src/main.zig is unaffected.
+    // -----------------------------------------------------------------------
+    const build_ffi = b.option(bool, "ffi", "Build the C-ABI shared + static library (libzero_db.{so,dylib,a})") orelse false;
+    if (build_ffi) {
+        // The FFI library uses src/root.zig as the root source file.
+        // root.zig already imports `ffi/c_api.zig`, so the `pub export`
+        // entry points land in the resulting library. Using root as the
+        // root means relative imports inside c_api.zig (../engine/...)
+        // resolve correctly.
+        const ffi_shared_root = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const ffi_shared = b.addLibrary(.{
+            .name = "zero_db",
+            .root_module = ffi_shared_root,
+            .linkage = .dynamic,
+        });
+        b.installArtifact(ffi_shared);
+
+        const ffi_static_root = b.createModule(.{
+            .root_source_file = b.path("src/root.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const ffi_static = b.addLibrary(.{
+            .name = "zero_db",
+            .root_module = ffi_static_root,
+            .linkage = .static,
+        });
+        b.installArtifact(ffi_static);
+
+        b.installFile("src/ffi/zero_db.h", "include/zero_db.h");
+    }
+
     // Just like flags, top level steps are also listed in the `--help` menu.
     //
     // The Zig build system is entirely implemented in userland, which means

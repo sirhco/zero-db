@@ -43,6 +43,15 @@ pub const varint = @import("util/varint.zig");
 pub const crc = @import("util/crc.zig");
 pub const endian = @import("util/endian.zig");
 
+pub const ffi = @import("ffi/c_api.zig");
+
+// Force comptime analysis of every `pub export` symbol in c_api.zig so
+// the linker keeps them when building the FFI library. Without this
+// reference, `zig build -Dffi=true` produces an empty libzero_db.
+comptime {
+    _ = ffi;
+}
+
 pub const Engine = engine.Engine;
 pub const IndexBlock = sstable_index.IndexBlock;
 pub const BlockLocator = sstable_index.BlockLocator;
@@ -91,4 +100,5 @@ test {
     _ = @import("util/varint.zig");
     _ = @import("util/crc.zig");
     _ = @import("util/endian.zig");
+    _ = @import("ffi/c_api.zig");
 }
