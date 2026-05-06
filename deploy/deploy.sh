@@ -28,6 +28,10 @@ set -euo pipefail
 : "${GCS_BUCKET:?GCS_BUCKET is required}"
 : "${AR_REPO:?AR_REPO is required}"
 SERVICE_NAME="${SERVICE_NAME:-zero-db}"
+# Optional dedicated runtime SA. When set, baked into the revision spec
+# so Cloud Run uses it as the request-time identity. When unset, Cloud
+# Run falls back to the project's default compute SA.
+RUNTIME_SA="${RUNTIME_SA:-}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -36,12 +40,20 @@ GIT_SHA="$(git rev-parse --short=12 HEAD 2>/dev/null || echo "untagged")"
 IMAGE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}/${SERVICE_NAME}:${GIT_SHA}"
 
 echo "==> Building image: ${IMAGE}"
-docker build -f deploy/Dockerfile -t "${IMAGE}" .
+# Cloud Run runs amd64/linux. Apple Silicon (and other arm64) hosts must
+# cross-build or Cloud Run rejects the manifest.
+docker build --platform linux/amd64 -f deploy/Dockerfile -t "${IMAGE}" .
 
 echo "==> Pushing to Artifact Registry"
 docker push "${IMAGE}"
 
 echo "==> Deploying to Cloud Run"
+SA_FLAG=()
+if [[ -n "${RUNTIME_SA}" ]]; then
+  echo "    runtime SA: ${RUNTIME_SA}"
+  SA_FLAG=(--service-account "${RUNTIME_SA}")
+fi
+
 gcloud run deploy "${SERVICE_NAME}" \
   --project "${GCP_PROJECT}" \
   --region "${GCP_REGION}" \
@@ -53,7 +65,10 @@ gcloud run deploy "${SERVICE_NAME}" \
   --memory 512Mi \
   --cpu 1 \
   --concurrency 80 \
-  --timeout 60s
+  --timeout 60s \
+  --max-instances 1 \
+  --no-cpu-throttling \
+  "${SA_FLAG[@]}"
 
 echo "==> Live: ${SERVICE_NAME} (${GIT_SHA})"
 gcloud run services describe "${SERVICE_NAME}" \

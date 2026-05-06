@@ -64,28 +64,72 @@ fn serve(init: std.process.Init, log: *Io.Writer) !void {
     const io = init.io;
 
     const port = parsePort(init.environ_map.*) orelse 8080;
+    const env = init.environ_map.*;
 
-    // Production wiring (enabled in Phase 18, the Cloud Run packaging
-    // phase). Sketch:
+    // Production wiring is gated on env vars so the same binary runs
+    // both locally (in-memory only) and on Cloud Run (GCS-backed).
     //
-    //     var rt = zero_db.gcs.RealTransport.init(gpa, io);
-    //     defer rt.deinit();
-    //     var ts = zero_db.auth.TokenSource.init(
-    //         gpa,
-    //         rt.transport(),
-    //         zero_db.auth.DEFAULT_METADATA_URL,
-    //         zero_db.auth.SystemClock.clock(),
-    //     );
-    //     defer ts.deinit();
-    //     var client = zero_db.gcs.Client.init(gpa, rt.transport(), .{ .token_source = &ts });
-    //     defer client.deinit();
-    //     // engine.init takes (..., bucket, manifest_object, &client) once
-    //     // Phase 12 lands the upload + manifest path.
+    //   GCS_BUCKET        — when set, persistence is enabled.
+    //   MANIFEST_OBJECT   — defaults to "manifest.json".
+    //   WAL_PATH          — defaults to "/tmp/zero-db-wal.log" on Cloud Run.
     //
-    // Until Phase 12, the engine remains in-memory only on cold start.
+    // Authentication: the TokenSource hits the GCE metadata service,
+    // which is reachable from inside Cloud Run automatically. Outside
+    // Cloud Run (local dev) the token fetch fails and the engine falls
+    // back to in-memory mode.
+    const gcs_bucket: ?[]const u8 = env.get("GCS_BUCKET");
+    const manifest_object: []const u8 = env.get("MANIFEST_OBJECT") orelse "manifest.json";
+    const wal_path: ?[]const u8 = if (gcs_bucket != null)
+        env.get("WAL_PATH") orelse "/tmp/zero-db-wal.log"
+    else
+        null;
 
-    var engine = try zero_db.engine.Engine.init(gpa, .{});
+    var rt: ?zero_db.gcs.RealTransport = null;
+    var ts: ?zero_db.auth.TokenSource = null;
+    var gcs_client: ?zero_db.gcs.Client = null;
+    defer {
+        if (gcs_client) |*c| c.deinit();
+        if (ts) |*t| t.deinit();
+        if (rt) |*r| r.deinit();
+    }
+
+    var engine_opts: zero_db.engine.Options = .{};
+    if (gcs_bucket) |bucket| {
+        rt = zero_db.gcs.RealTransport.init(gpa, io);
+        ts = zero_db.auth.TokenSource.init(
+            gpa,
+            rt.?.transport(),
+            zero_db.auth.DEFAULT_METADATA_URL,
+            zero_db.auth.SystemClock.clock(),
+        );
+        gcs_client = zero_db.gcs.Client.init(gpa, rt.?.transport(), .{ .token_source = &ts.? });
+        engine_opts.gcs_client = &gcs_client.?;
+        engine_opts.bucket = bucket;
+        engine_opts.manifest_object = manifest_object;
+        engine_opts.wal_path = wal_path;
+
+        try log.print("persistence: GCS bucket={s}, manifest={s}, wal={s}\n", .{
+            bucket, manifest_object, wal_path.?,
+        });
+    } else {
+        try log.print("persistence: in-memory only (no GCS_BUCKET)\n", .{});
+    }
+    try log.flush();
+
+    // Bind the listener BEFORE engine init so Cloud Run's startup probe
+    // sees the port up immediately. Engine init may fetch the manifest
+    // from GCS, which can take a few hundred ms; that work happens after
+    // the bind, so we do not race the platform's startup timeout.
+    const addr = try Io.net.IpAddress.parse("0.0.0.0", port);
+    var listener = try addr.listen(io, .{ .reuse_address = true });
+    defer listener.deinit(io);
+
+    try log.print("zero-db listening on 0.0.0.0:{d}\n", .{port});
+    try log.flush();
+
+    var engine = try zero_db.engine.Engine.init(gpa, engine_opts);
     defer engine.deinit();
+    if (gcs_bucket != null) try engine.startCompactor();
 
     // Per-request arena pool. Cloud Run typical concurrency is ~80; 32
     // pooled arenas is a comfortable upper bound on simultaneous in-
@@ -93,11 +137,7 @@ fn serve(init: std.process.Init, log: *Io.Writer) !void {
     var pool = zero_db.arena_pool.ArenaPool.init(gpa, 32);
     defer pool.deinit();
 
-    const addr = try Io.net.IpAddress.parse("0.0.0.0", port);
-    var listener = try addr.listen(io, .{ .reuse_address = true });
-    defer listener.deinit(io);
-
-    try log.print("zero-db serving on 0.0.0.0:{d}\n", .{port});
+    try log.print("zero-db ready (engine init complete)\n", .{});
     try log.flush();
 
     while (true) {

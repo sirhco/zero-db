@@ -197,12 +197,47 @@ A typical small-tenant footprint: tens of MB stored, sub-million reads/day → c
 ### Deployment
 
 ```bash
-GCP_PROJECT=my-project GCP_REGION=us-central1 \
-  GCS_BUCKET=my-zero-db AR_REPO=zero-db \
-  ./deploy/deploy.sh
+# One-time: create a dedicated runtime service account
+gcloud iam service-accounts create zero-db-runtime \
+  --display-name="zero-db Cloud Run runtime"
+
+SA=zero-db-runtime@my-project.iam.gserviceaccount.com
+gcloud storage buckets add-iam-policy-binding gs://my-zero-db \
+  --member="serviceAccount:${SA}" \
+  --role="roles/storage.objectAdmin"
+
+# Deploy
+GCP_PROJECT=my-project \
+GCP_REGION=us-central1 \
+GCS_BUCKET=my-zero-db \
+AR_REPO=zero-db \
+RUNTIME_SA="${SA}" \
+./deploy/deploy.sh
 ```
 
-The runtime service account needs `roles/storage.objectAdmin` on the bucket. Tokens come from the GCE metadata service automatically — no static credentials, no secret manager integration required.
+`deploy/deploy.sh` cross-builds for `linux/amd64` (so it works from Apple Silicon hosts), pushes to Artifact Registry, and deploys with:
+
+- `--service-account=${RUNTIME_SA}` — dedicated identity instead of the default compute SA
+- `--no-cpu-throttling` — keeps the background compactor making progress between requests
+- `--max-instances=1` — single-writer safety until multi-writer manifest preconditions are exercised in production
+- CA bundle baked into the distroless runtime image so Zig's `std.http.Client` can validate `storage.googleapis.com`
+
+Tokens come from the GCE metadata service automatically — no static credentials, no secret manager integration required.
+
+### Verifying a deploy
+
+```bash
+URL=$(gcloud run services describe zero-db --region us-central1 --format='value(status.url)')
+
+curl -X PUT -d 'hello' "${URL}/v1/kv/foo"
+curl -X POST "${URL}/admin/flush"
+curl "${URL}/admin/stats"      # expect: {"sstables":1,"active_entries":0,"compaction_failures":0}
+
+gcloud storage ls gs://my-zero-db/sstables/
+gcloud storage cat gs://my-zero-db/manifest.json
+```
+
+A `compaction_failures` value greater than zero indicates that a background flush hit an error — check `gcloud run services logs read zero-db --region us-central1` for `compaction failed: <ErrorName>` and the more specific `persistAndOpen: putObject(...) failed: <ErrorName>` to identify the failing step.
 
 ### Failure modes the system survives
 
@@ -213,7 +248,7 @@ The runtime service account needs `roles/storage.objectAdmin` on the bucket. Tok
 
 ### Failure modes that need operator action
 
-- **Multi-writer conflict**: today this corrupts the manifest. Until `If-Generation-Match` lands, run **one writer instance per bucket**. Cloud Run `--max-instances=1` is the operator-visible knob.
+- **Multi-writer conflict**: `If-Generation-Match` is wired through `Client.putObjectIfMatch`; a concurrent writer's update surfaces as `error.ManifestConflict`. The shipped `deploy.sh` still pins `--max-instances=1` until the multi-writer path has run hours of production traffic. Loosen to `--max-instances=N` when you have telemetry + a documented retry-on-conflict client.
 - **Bucket permissions revoked mid-flight**: the engine surfaces `AuthFailed` and stops accepting writes; logs include the failed operation. Restoring permissions and redeploying recovers.
 - **Bucket deletion**: nothing recoverable. Use object versioning + retention policies on the bucket if you care.
 

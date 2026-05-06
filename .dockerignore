@@ -1,0 +1,10 @@
+.git
+.gitignore
+.zig-cache
+zig-out
+docs
+deploy
+LICENSE
+README.md
+PLAN.md
+.dockerignore

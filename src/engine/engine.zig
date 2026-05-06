@@ -272,7 +272,10 @@ pub const Engine = struct {
     /// raises an error. We do not propagate to a calling user thread —
     /// telemetry only.
     pub fn recordCompactionFailure(self: *Engine, err: anyerror) void {
-        _ = &err; // telemetry hook — error name not surfaced today
+        // Surface the underlying error to stderr so production log
+        // aggregation can see WHY a background flush / merge failed.
+        // Without this the counter bumps but the cause is invisible.
+        std.debug.print("compaction failed: {s}\n", .{@errorName(err)});
         self.mu.lock();
         defer self.mu.unlock();
         self.compaction_failure_count +%= 1;
@@ -354,15 +357,24 @@ pub const Engine = struct {
             @intCast(manifest_buf.len),
             manifest_buf,
         ) catch |err| switch (err) {
+            // A fresh bucket has no manifest object — GCS returns 404
+            // which Client.rangeGet maps to BadStatus.
             error.BadStatus => {
-                // Treat any non-success as "no manifest yet". On a fresh
-                // bucket the next manifest write goes out with
-                // `If-Generation-Match: 0` (must-not-exist).
                 self.manifest = manifest_mod.Manifest.init(self.gpa);
                 self.manifest_generation = 0;
                 return;
             },
-            else => return error.ManifestLoadFailed,
+            // Network / DNS / TLS / metadata-service unreachable — these
+            // are real configuration problems, but on a fresh deploy we
+            // also do not want to wedge the container forever. Log the
+            // underlying error and proceed as if the bucket were empty;
+            // first write will retry the network path.
+            else => {
+                std.debug.print("loadFromManifest: rangeGet failed: {s} — proceeding as fresh bucket\n", .{@errorName(err)});
+                self.manifest = manifest_mod.Manifest.init(self.gpa);
+                self.manifest_generation = 0;
+                return;
+            },
         };
 
         var m = manifest_mod.Manifest.parse(self.gpa, manifest_buf[0..meta.body_len]) catch
@@ -573,8 +585,10 @@ pub const Engine = struct {
         const object_path = std.fmt.bufPrint(&path_buf, "sstables/{d:0>6}.sst", .{id}) catch
             return error.OutOfMemory;
 
-        client.putObject(self.options.bucket, object_path, sst_bytes) catch
+        client.putObject(self.options.bucket, object_path, sst_bytes) catch |err| {
+            std.debug.print("persistAndOpen: putObject({s}) failed: {s}\n", .{ object_path, @errorName(err) });
             return error.ManifestLoadFailed;
+        };
 
         const min_max = scanMinMaxKeys(ft);
 

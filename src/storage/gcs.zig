@@ -162,7 +162,9 @@ pub const Client = struct {
 
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            var auth_buf: [512]u8 = undefined;
+            // Real GCS OAuth2 tokens commonly exceed 1 KiB. Sized to 4 KiB
+            // to leave headroom for any signed JWT additions.
+            var auth_buf: [4096]u8 = undefined;
             const auth_value = try self.resolveAuthHeader(&auth_buf);
 
             var headers: [2]Header = undefined;
@@ -180,9 +182,11 @@ pub const Client = struct {
                 return .{ .body_len = resp.body_len, .generation = resp.generation };
             }
             if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
+                std.debug.print("rangeGet: 401 on attempt {d}, invalidating token + retrying\n", .{attempt});
                 self.options.token_source.?.invalidate();
                 continue;
             }
+            std.debug.print("rangeGet: failing with status {d} url={s}\n", .{ resp.status, url });
             return switch (resp.status) {
                 401, 403 => error.AuthFailed,
                 else => error.BadStatus,
@@ -192,7 +196,10 @@ pub const Client = struct {
 
     fn resolveAuthHeader(self: *Client, auth_buf: []u8) Error!?[]const u8 {
         if (self.options.token_source) |ts| {
-            const tok = ts.token() catch return error.AuthFailed;
+            const tok = ts.token() catch |err| {
+                std.debug.print("resolveAuthHeader: TokenSource.token failed: {s}\n", .{@errorName(err)});
+                return error.AuthFailed;
+            };
             return std.fmt.bufPrint(auth_buf, "Bearer {s}", .{tok}) catch error.AuthFailed;
         }
         if (self.options.bearer_token) |t| {
@@ -247,7 +254,9 @@ pub const Client = struct {
 
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            var auth_buf: [512]u8 = undefined;
+            // Real GCS OAuth2 tokens commonly exceed 1 KiB. Sized to 4 KiB
+            // to leave headroom for any signed JWT additions.
+            var auth_buf: [4096]u8 = undefined;
             const auth_value = try self.resolveAuthHeader(&auth_buf);
 
             var headers: [4]Header = undefined;
@@ -269,9 +278,11 @@ pub const Client = struct {
             if (resp.status == 200 or resp.status == 201) return resp.generation;
             if (resp.status == 412) return error.PreconditionFailed;
             if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
+                std.debug.print("putObjectIfMatch: 401 on attempt {d}, invalidating token + retrying\n", .{attempt});
                 self.options.token_source.?.invalidate();
                 continue;
             }
+            std.debug.print("putObjectIfMatch: failing with status {d} url={s}\n", .{ resp.status, url });
             return switch (resp.status) {
                 401, 403 => error.AuthFailed,
                 else => error.PutFailed,
@@ -295,7 +306,9 @@ pub const Client = struct {
 
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            var auth_buf: [512]u8 = undefined;
+            // Real GCS OAuth2 tokens commonly exceed 1 KiB. Sized to 4 KiB
+            // to leave headroom for any signed JWT additions.
+            var auth_buf: [4096]u8 = undefined;
             const auth_value = try self.resolveAuthHeader(&auth_buf);
 
             var headers: [1]Header = undefined;
@@ -697,6 +710,73 @@ pub const RealTransport = struct {
         return dst[0..headers.len];
     }
 
+    /// Issue a one-shot request via the lower-level `client.request` API
+    /// (vs `fetch`) so we can read response headers — specifically
+    /// `x-goog-generation` for multi-writer manifest preconditions.
+    /// `body` is null for GET/DELETE, set for PUT.
+    /// `body_dst` is filled with up to its length of response bytes; for
+    /// PUT/DELETE we still drain the body (small XML/JSON), but the
+    /// returned `body_len` may be 0 if `body_dst.len == 0`.
+    fn doRequest(
+        self: *RealTransport,
+        method: std.http.Method,
+        url: []const u8,
+        headers: []const Header,
+        body: ?[]const u8,
+        body_dst: []u8,
+    ) anyerror!Response {
+        var stack_headers: [16]std.http.Header = undefined;
+        const extra = try translateHeaders(headers, &stack_headers);
+
+        const uri = try std.Uri.parse(url);
+        var req = try self.inner.request(method, uri, .{
+            .extra_headers = extra,
+            .keep_alive = true,
+        });
+        defer req.deinit();
+
+        if (body) |b| {
+            // sendBodyComplete needs []u8; the GCS client passes the
+            // body to us as []const u8. Const-cast is safe: the buffer
+            // is read-only-consumed by sendBodyComplete.
+            try req.sendBodyComplete(@constCast(b));
+        } else {
+            try req.sendBodiless();
+        }
+
+        var redirect_buf: [8192]u8 = undefined;
+        var resp = try req.receiveHead(&redirect_buf);
+
+        // Parse generation header before reading the body — head bytes
+        // are invalidated once the body stream is initialized.
+        var generation: ?i64 = null;
+        var hit = resp.head.iterateHeaders();
+        while (hit.next()) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "x-goog-generation")) {
+                generation = std.fmt.parseInt(i64, h.value, 10) catch null;
+                break;
+            }
+        }
+
+        // Drain the response body via a temporary Allocating writer
+        // (matches what fetch did internally). Then copy a clamped
+        // prefix into the caller's body_dst.
+        var transfer_buf: [4096]u8 = undefined;
+        const reader = resp.reader(&transfer_buf);
+        var aw: std.Io.Writer.Allocating = .init(self.gpa);
+        defer aw.deinit();
+        _ = reader.streamRemaining(&aw.writer) catch {};
+        const resp_body = aw.written();
+        const n = @min(body_dst.len, resp_body.len);
+        @memcpy(body_dst[0..n], resp_body[0..n]);
+
+        return .{
+            .status = @intFromEnum(resp.head.status),
+            .body_len = n,
+            .generation = generation,
+        };
+    }
+
     fn getImpl(
         ptr: *anyopaque,
         url: []const u8,
@@ -704,24 +784,7 @@ pub const RealTransport = struct {
         body_dst: []u8,
     ) anyerror!Response {
         const self: *RealTransport = @ptrCast(@alignCast(ptr));
-
-        var stack_headers: [16]std.http.Header = undefined;
-        const extra = try translateHeaders(headers, &stack_headers);
-
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-
-        const result = try self.inner.fetch(.{
-            .location = .{ .url = url },
-            .method = .GET,
-            .extra_headers = extra,
-            .response_writer = &aw.writer,
-        });
-
-        const body = aw.written();
-        const n = @min(body_dst.len, body.len);
-        @memcpy(body_dst[0..n], body[0..n]);
-        return .{ .status = @intFromEnum(result.status), .body_len = n };
+        return self.doRequest(.GET, url, headers, null, body_dst);
     }
 
     fn putImpl(
@@ -731,22 +794,8 @@ pub const RealTransport = struct {
         body: []const u8,
     ) anyerror!Response {
         const self: *RealTransport = @ptrCast(@alignCast(ptr));
-
-        var stack_headers: [16]std.http.Header = undefined;
-        const extra = try translateHeaders(headers, &stack_headers);
-
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-
-        const result = try self.inner.fetch(.{
-            .location = .{ .url = url },
-            .method = .PUT,
-            .payload = body,
-            .extra_headers = extra,
-            .response_writer = &aw.writer,
-        });
-
-        return .{ .status = @intFromEnum(result.status), .body_len = 0 };
+        var no_body: [0]u8 = .{};
+        return self.doRequest(.PUT, url, headers, body, &no_body);
     }
 
     fn deleteImpl(
@@ -755,21 +804,8 @@ pub const RealTransport = struct {
         headers: []const Header,
     ) anyerror!Response {
         const self: *RealTransport = @ptrCast(@alignCast(ptr));
-
-        var stack_headers: [16]std.http.Header = undefined;
-        const extra = try translateHeaders(headers, &stack_headers);
-
-        var aw: std.Io.Writer.Allocating = .init(self.gpa);
-        defer aw.deinit();
-
-        const result = try self.inner.fetch(.{
-            .location = .{ .url = url },
-            .method = .DELETE,
-            .extra_headers = extra,
-            .response_writer = &aw.writer,
-        });
-
-        return .{ .status = @intFromEnum(result.status), .body_len = 0 };
+        var no_body: [0]u8 = .{};
+        return self.doRequest(.DELETE, url, headers, null, &no_body);
     }
 };
 

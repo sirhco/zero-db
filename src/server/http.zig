@@ -148,11 +148,12 @@ fn adminCompact(engine: *Engine) HandleError!Response {
 fn adminStats(arena: std.mem.Allocator, engine: *Engine) HandleError!Response {
     const sst = engine.sstableCount();
     const active = engine.entryCountActive();
+    const failures = engine.compactionFailureCount();
 
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"sstables\":{d},\"active_entries\":{d}}}\n",
-        .{ sst, active },
+        "{{\"sstables\":{d},\"active_entries\":{d},\"compaction_failures\":{d}}}\n",
+        .{ sst, active, failures },
     );
     return .{
         .status = 200,

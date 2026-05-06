@@ -10,12 +10,12 @@ ARG ZIG_VERSION=0.16.0
 RUN apk add --no-cache curl xz tar ca-certificates
 WORKDIR /workspace
 
-# Download + verify Zig. Pin the URL by version. If the upstream tarball
-# layout shifts, update the move target on the next line accordingly.
-RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" \
+# Download Zig. URL convention since ~0.14 puts arch before OS:
+#   zig-x86_64-linux-VERSION.tar.xz
+RUN curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
       -o zig.tar.xz \
  && tar -xJf zig.tar.xz \
- && mv "zig-linux-x86_64-${ZIG_VERSION}" /opt/zig \
+ && mv "zig-x86_64-linux-${ZIG_VERSION}" /opt/zig \
  && rm zig.tar.xz
 ENV PATH=/opt/zig:$PATH
 
@@ -31,6 +31,10 @@ RUN zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
 # ---------------------------------------------------------------------------
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /workspace/zig-out/bin/zero_db /usr/local/bin/zero_db
+# Explicitly carry the Alpine CA bundle into the runtime image. Zig's
+# std.http.Client searches several standard paths; the Debian-style path
+# at /etc/ssl/certs/ca-certificates.crt is the most universal.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 USER nonroot
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/zero_db"]
