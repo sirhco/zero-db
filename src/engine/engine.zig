@@ -61,6 +61,7 @@ pub const Error = error{
     Frozen,
     ManifestLoadFailed,
     OverMemoryBudget,
+    ManifestConflict,
 } || writer.Error || reader_mod.ReaderError;
 
 /// Generous upper bound for the manifest object on cold start. The engine
@@ -134,6 +135,14 @@ pub const Engine = struct {
     /// GCS mode; ignored otherwise. Mutations go here first, then the
     /// serialized form is putObject'd back to GCS.
     manifest: ?manifest_mod.Manifest = null,
+
+    /// Last-known GCS generation of the manifest object. `null` until
+    /// the manifest is first read or written. The engine attaches this
+    /// as `If-Generation-Match` to every manifest write so a concurrent
+    /// writer's update surfaces as `error.ManifestConflict` instead of
+    /// silently being clobbered. `0` means "must not exist" — used on a
+    /// fresh bucket where loadFromManifest got a 404.
+    manifest_generation: ?i64 = null,
 
     /// Shared BlockCache threaded into every Reader the engine constructs.
     /// Heap-allocated so its address is stable across moves of `Engine`
@@ -338,7 +347,7 @@ pub const Engine = struct {
             return error.OutOfMemory;
         defer self.gpa.free(manifest_buf);
 
-        const n = client.rangeGet(
+        const meta = client.rangeGetWithMeta(
             self.options.bucket,
             self.options.manifest_object,
             0,
@@ -346,18 +355,20 @@ pub const Engine = struct {
             manifest_buf,
         ) catch |err| switch (err) {
             error.BadStatus => {
-                // Treat any non-success as "no manifest yet". A real
-                // implementation would distinguish 404 from 5xx; FakeServer
-                // returns 404 here and Client maps it to BadStatus.
+                // Treat any non-success as "no manifest yet". On a fresh
+                // bucket the next manifest write goes out with
+                // `If-Generation-Match: 0` (must-not-exist).
                 self.manifest = manifest_mod.Manifest.init(self.gpa);
+                self.manifest_generation = 0;
                 return;
             },
             else => return error.ManifestLoadFailed,
         };
 
-        var m = manifest_mod.Manifest.parse(self.gpa, manifest_buf[0..n]) catch
+        var m = manifest_mod.Manifest.parse(self.gpa, manifest_buf[0..meta.body_len]) catch
             return error.ManifestLoadFailed;
         errdefer m.deinit();
+        self.manifest_generation = meta.generation;
 
         // Build a Reader per manifest entry, in oldest-first order. Insert
         // at index 0 each time so the newest entry sits at sstables[0].
@@ -525,10 +536,16 @@ pub const Engine = struct {
                     return;
                 };
                 defer self.gpa.free(bytes);
-                client.putObject(self.options.bucket, self.options.manifest_object, bytes) catch {
+                const new_gen = client.putObjectIfMatch(
+                    self.options.bucket,
+                    self.options.manifest_object,
+                    bytes,
+                    self.manifest_generation,
+                ) catch {
                     m.wal_committed_bytes = old_checkpoint;
                     return;
                 };
+                if (new_gen) |g| self.manifest_generation = g;
             }
             w.truncateAbsorbed(old_checkpoint) catch {};
         } else {
@@ -580,8 +597,16 @@ pub const Engine = struct {
         const bytes = self.manifest.?.serialize() catch return error.OutOfMemory;
         defer self.gpa.free(bytes);
         const client = self.options.gcs_client.?;
-        client.putObject(self.options.bucket, self.options.manifest_object, bytes) catch
-            return error.ManifestLoadFailed;
+        const new_gen = client.putObjectIfMatch(
+            self.options.bucket,
+            self.options.manifest_object,
+            bytes,
+            self.manifest_generation,
+        ) catch |err| switch (err) {
+            error.PreconditionFailed => return error.ManifestConflict,
+            else => return error.ManifestLoadFailed,
+        };
+        if (new_gen) |g| self.manifest_generation = g;
     }
 
     // ---- read path --------------------------------------------------------
@@ -728,8 +753,16 @@ pub const Engine = struct {
         try temp.append(merged_entry);
         const bytes = temp.serialize() catch return error.OutOfMemory;
         defer self.gpa.free(bytes);
-        client.putObject(self.options.bucket, self.options.manifest_object, bytes) catch
-            return error.ManifestLoadFailed;
+        const new_gen = client.putObjectIfMatch(
+            self.options.bucket,
+            self.options.manifest_object,
+            bytes,
+            self.manifest_generation,
+        ) catch |err| switch (err) {
+            error.PreconditionFailed => return error.ManifestConflict,
+            else => return error.ManifestLoadFailed,
+        };
+        if (new_gen) |g| self.manifest_generation = g;
 
         // Snapshot old object paths before tearing down handles so we can
         // best-effort delete them after the swap. Each path string is
@@ -1180,6 +1213,42 @@ test "Engine: fresh bucket (no manifest) inits empty" {
 
     try testing.expectEqual(@as(usize, 0), e.sstableCount());
     try testing.expectEqual(@as(?[]u8, null), try e.get("anything", gpa));
+}
+
+test "Engine: concurrent writers conflict via If-Generation-Match" {
+    const gpa = testing.allocator;
+    var fs = gcs.FakeServer.init(gpa, gcs.DEFAULT_BASE_URL, "bk", "unused", "");
+    defer fs.deinit();
+    var client = gcs.Client.init(gpa, fs.transport(), .{});
+    defer client.deinit();
+
+    var ea = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 0,
+    });
+    defer ea.deinit();
+    var eb = try Engine.init(gpa, .{
+        .gcs_client = &client,
+        .bucket = "bk",
+        .manifest_object = "manifest.json",
+        .block_cache_bytes = 0,
+    });
+    defer eb.deinit();
+
+    // Both engines see manifest_generation = 0 (must-not-exist on first
+    // write). Engine A flushes first — its write succeeds and bumps the
+    // shared manifest's generation.
+    try ea.set("alpha", "AAA");
+    try ea.flush();
+    try testing.expect(ea.manifest_generation != null and ea.manifest_generation.? != 0);
+
+    // Engine B still believes it's writing on top of generation 0. Its
+    // flush should surface ManifestConflict rather than silently
+    // clobbering Engine A's manifest.
+    try eb.set("bravo", "BB");
+    try testing.expectError(error.ManifestConflict, eb.flush());
 }
 
 test "Engine: cold-restart durability — keys survive teardown" {

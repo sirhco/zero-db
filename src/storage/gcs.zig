@@ -28,6 +28,7 @@ pub const Error = error{
     PutUnsupported,
     DeleteFailed,
     DeleteUnsupported,
+    PreconditionFailed,
 };
 
 pub const DEFAULT_BASE_URL: []const u8 = "https://storage.googleapis.com";
@@ -41,6 +42,11 @@ pub const Response = struct {
     status: u16,
     /// Bytes the transport wrote into the caller-provided `body_dst`.
     body_len: usize,
+    /// GCS object generation, when the transport can read it from the
+    /// response (e.g. `x-goog-generation` header). FakeServer always
+    /// populates this; RealTransport returns null today — generation-
+    /// aware production paths require the lower-level Request API.
+    generation: ?i64 = null,
 };
 
 /// Pluggable HTTP transport. Implementations answer `GET` (range reads)
@@ -122,6 +128,27 @@ pub const Client = struct {
         len: u32,
         dst: []u8,
     ) Error!usize {
+        const r = try self.rangeGetWithMeta(bucket, object, start, len, dst);
+        return r.body_len;
+    }
+
+    pub const RangeGetResult = struct {
+        body_len: usize,
+        generation: ?i64,
+    };
+
+    /// Same as `rangeGet` but returns the object's GCS generation when
+    /// the transport surfaces it. Used by `Engine.loadFromManifest` to
+    /// capture the manifest's generation so subsequent writes carry an
+    /// `If-Generation-Match` precondition.
+    pub fn rangeGetWithMeta(
+        self: *Client,
+        bucket: []const u8,
+        object: []const u8,
+        start: u64,
+        len: u32,
+        dst: []u8,
+    ) Error!RangeGetResult {
         if (len == 0) return error.EmptyRange;
         std.debug.assert(len <= dst.len);
 
@@ -133,9 +160,6 @@ pub const Client = struct {
         var range_buf: [64]u8 = undefined;
         const range_value = formatRangeHeader(&range_buf, start, len) catch return error.EmptyRange;
 
-        // Single attempt; on 401 with a TokenSource configured we retry
-        // once after invalidating the cached token. The metadata service
-        // may have rotated us early.
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             var auth_buf: [512]u8 = undefined;
@@ -152,7 +176,9 @@ pub const Client = struct {
             const resp = self.transport.get(url, headers[0..n], dst[0..len]) catch
                 return error.HttpError;
 
-            if (resp.status == 200 or resp.status == 206) return resp.body_len;
+            if (resp.status == 200 or resp.status == 206) {
+                return .{ .body_len = resp.body_len, .generation = resp.generation };
+            }
             if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
                 self.options.token_source.?.invalidate();
                 continue;
@@ -185,6 +211,25 @@ pub const Client = struct {
         object: []const u8,
         body: []const u8,
     ) Error!void {
+        _ = try self.putObjectIfMatch(bucket, object, body, null);
+    }
+
+    /// Same as `putObject` but with optional `If-Generation-Match`
+    /// precondition. `expected_generation`:
+    ///   - `null`     — no precondition (same as `putObject`)
+    ///   - `0`        — object must not exist (create-only)
+    ///   - `> 0`      — current GCS generation must equal this value
+    /// Returns the new generation when the transport surfaces it
+    /// (FakeServer always does; RealTransport returns `null` until
+    /// response-header readback ships). Returns `error.PreconditionFailed`
+    /// on a 412 — caller is expected to reload state and retry.
+    pub fn putObjectIfMatch(
+        self: *Client,
+        bucket: []const u8,
+        object: []const u8,
+        body: []const u8,
+        expected_generation: ?i64,
+    ) Error!?i64 {
         var url_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer url_arena.deinit();
         const url = buildObjectUrl(url_arena.allocator(), self.options.base_url, bucket, object) catch
@@ -194,24 +239,35 @@ pub const Client = struct {
         const len_value = std.fmt.bufPrint(&len_buf, "{d}", .{body.len}) catch
             return error.OutOfMemory;
 
+        var precond_buf: [32]u8 = undefined;
+        const precond_value: ?[]const u8 = if (expected_generation) |g|
+            std.fmt.bufPrint(&precond_buf, "{d}", .{g}) catch return error.OutOfMemory
+        else
+            null;
+
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             var auth_buf: [512]u8 = undefined;
             const auth_value = try self.resolveAuthHeader(&auth_buf);
 
-            var headers: [3]Header = undefined;
+            var headers: [4]Header = undefined;
             var n: usize = 2;
             headers[0] = .{ .name = "Content-Type", .value = "application/octet-stream" };
             headers[1] = .{ .name = "Content-Length", .value = len_value };
             if (auth_value) |av| {
-                headers[2] = .{ .name = "Authorization", .value = av };
-                n = 3;
+                headers[n] = .{ .name = "Authorization", .value = av };
+                n += 1;
+            }
+            if (precond_value) |p| {
+                headers[n] = .{ .name = "x-goog-if-generation-match", .value = p };
+                n += 1;
             }
 
             const resp = self.transport.put(url, headers[0..n], body) catch
                 return error.HttpError;
 
-            if (resp.status == 200 or resp.status == 201) return;
+            if (resp.status == 200 or resp.status == 201) return resp.generation;
+            if (resp.status == 412) return error.PreconditionFailed;
             if (resp.status == 401 and attempt == 0 and self.options.token_source != null) {
                 self.options.token_source.?.invalidate();
                 continue;
@@ -348,6 +404,11 @@ fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
 /// returns (the caller's URL buffer may be a stack-local arena that goes
 /// out of scope before the test inspects state).
 pub const FakeServer = struct {
+    pub const StoredObject = struct {
+        body: []u8,
+        generation: i64,
+    };
+
     gpa: std.mem.Allocator,
     base_url: []const u8,
     bucket: []const u8,
@@ -373,8 +434,14 @@ pub const FakeServer = struct {
 
     /// PUT bodies received during the test, keyed by URL. Survives subsequent
     /// GETs of the same URL — that round-trip is the headline test of
-    /// Phase 12.
-    received_puts: std.StringHashMap([]u8),
+    /// Phase 12. Each entry also carries a monotonically-increasing
+    /// generation, mirroring GCS's per-object generation semantics; this
+    /// is what powers the multi-writer precondition tests.
+    received_puts: std.StringHashMap(StoredObject),
+
+    /// Monotonic generation counter applied to every PUT (across all
+    /// objects). Mirrors GCS's behavior closely enough for tests.
+    next_generation: i64 = 1,
 
     // Recorded request data — gpa-owned dupes; freed in deinit.
     last_url: ?[]u8 = null,
@@ -399,7 +466,7 @@ pub const FakeServer = struct {
             .bucket = bucket,
             .object = object,
             .object_bytes = object_bytes,
-            .received_puts = std.StringHashMap([]u8).init(gpa),
+            .received_puts = std.StringHashMap(StoredObject).init(gpa),
         };
     }
 
@@ -409,7 +476,7 @@ pub const FakeServer = struct {
         var it = self.received_puts.iterator();
         while (it.next()) |entry| {
             self.gpa.free(entry.key_ptr.*);
-            self.gpa.free(entry.value_ptr.*);
+            self.gpa.free(entry.value_ptr.*.body);
         }
         self.received_puts.deinit();
         self.* = undefined;
@@ -479,7 +546,7 @@ pub const FakeServer = struct {
         const n: usize = @min(want_len, body_dst.len);
         const s: usize = @intCast(r.start);
         @memcpy(body_dst[0..n], source_bytes[s .. s + n]);
-        return Response{ .status = 206, .body_len = n };
+        return Response{ .status = 206, .body_len = n, .generation = self.resolveGeneration(url) };
     }
 
     fn resolveBytes(self: *FakeServer, url: []const u8) ?[]const u8 {
@@ -488,7 +555,12 @@ pub const FakeServer = struct {
         const expected = buildObjectUrl(fba.allocator(), self.base_url, self.bucket, self.object) catch
             return null;
         if (std.mem.eql(u8, url, expected)) return self.object_bytes;
-        if (self.received_puts.get(url)) |body| return body;
+        if (self.received_puts.get(url)) |obj| return obj.body;
+        return null;
+    }
+
+    fn resolveGeneration(self: *FakeServer, url: []const u8) ?i64 {
+        if (self.received_puts.get(url)) |obj| return obj.generation;
         return null;
     }
 
@@ -518,6 +590,19 @@ pub const FakeServer = struct {
             return Response{ .status = s, .body_len = 0 };
         }
 
+        // GCS If-Generation-Match precondition. Value is decimal i64;
+        // 0 means "object must not exist". Mismatch returns 412.
+        if (findHeader(headers, "x-goog-if-generation-match")) |want| {
+            const expected = std.fmt.parseInt(i64, want, 10) catch -1;
+            const current: i64 = if (self.received_puts.get(url)) |obj| obj.generation else 0;
+            if (expected != current) {
+                return Response{ .status = 412, .body_len = 0, .generation = if (current == 0) null else current };
+            }
+        }
+
+        const new_gen = self.next_generation;
+        self.next_generation += 1;
+
         const url_copy = try self.gpa.dupe(u8, url);
         errdefer self.gpa.free(url_copy);
         const body_copy = try self.gpa.dupe(u8, body);
@@ -525,10 +610,10 @@ pub const FakeServer = struct {
 
         if (self.received_puts.fetchRemove(url)) |old| {
             self.gpa.free(old.key);
-            self.gpa.free(old.value);
+            self.gpa.free(old.value.body);
         }
-        try self.received_puts.put(url_copy, body_copy);
-        return Response{ .status = 200, .body_len = 0 };
+        try self.received_puts.put(url_copy, .{ .body = body_copy, .generation = new_gen });
+        return Response{ .status = 200, .body_len = 0, .generation = new_gen };
     }
 
     fn deleteImpl(
@@ -558,7 +643,7 @@ pub const FakeServer = struct {
 
         if (self.received_puts.fetchRemove(url)) |old| {
             self.gpa.free(old.key);
-            self.gpa.free(old.value);
+            self.gpa.free(old.value.body);
             return Response{ .status = 204, .body_len = 0 };
         }
         // GCS returns 404 when the object does not exist.
