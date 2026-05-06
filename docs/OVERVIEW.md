@@ -282,3 +282,5 @@ If you came here from a "how does this work" angle and want to dig deeper, the c
 | GCS HTTP client | `src/storage/gcs.zig` |
 | GCE metadata auth | `src/storage/auth.zig` |
 | Adaptive prefetch | `src/prefetch/adaptive.zig` |
+| C ABI library | `src/ffi/c_api.zig`, `src/ffi/zero_db.h` — see [`docs/EMBEDDING.md`](EMBEDDING.md) |
+| Cloud Run sidecar | see [`docs/SIDECAR.md`](SIDECAR.md) |
